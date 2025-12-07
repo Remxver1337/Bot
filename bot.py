@@ -20,6 +20,84 @@ REPLACEMENTS = {
     'А': 'A', 'С': 'C', 'О': 'O', 'Р': 'P', 'Е': 'E', 'Х': 'X', 'У': 'Y'
 }
 
+# Глобальный менеджер зеркал
+class MirrorManager:
+    def __init__(self):
+        self.db_name = "mirrors.db"
+        self.init_database()
+    
+    def init_database(self):
+        """Инициализация базы данных зеркал"""
+        conn = sqlite3.connect(self.db_name)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS mirrors (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                bot_token TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                is_active INTEGER DEFAULT 1
+            )
+        ''')
+        
+        conn.commit()
+        conn.close()
+    
+    def create_mirror(self, user_id: int, bot_token: str) -> Tuple[bool, str]:
+        """Создание нового зеркала"""
+        try:
+            # Проверка токена
+            test_app = Application.builder().token(bot_token).build()
+            
+            conn = sqlite3.connect(self.db_name)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                INSERT INTO mirrors (user_id, bot_token) VALUES (?, ?)
+            ''', (user_id, bot_token))
+            
+            conn.commit()
+            conn.close()
+            
+            return True, "✅ Зеркало успешно создано!"
+            
+        except Exception as e:
+            logger.error(f"Ошибка создания зеркала: {e}")
+            return False, f"❌ Ошибка: Неверный токен бота"
+    
+    def get_user_mirrors(self, user_id: int) -> List[Tuple]:
+        """Получение списка зеркал пользователя"""
+        conn = sqlite3.connect(self.db_name)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT id, bot_token, created_at, is_active FROM mirrors 
+            WHERE user_id = ? ORDER BY created_at DESC
+        ''', (user_id,))
+        
+        mirrors = cursor.fetchall()
+        conn.close()
+        return mirrors
+    
+    def delete_mirror(self, user_id: int, mirror_id: int) -> bool:
+        """Удаление зеркала"""
+        try:
+            conn = sqlite3.connect(self.db_name)
+            cursor = conn.cursor()
+            
+            cursor.execute('DELETE FROM mirrors WHERE id = ? AND user_id = ?', (mirror_id, user_id))
+            conn.commit()
+            conn.close()
+            return True
+            
+        except Exception as e:
+            logger.error(f"Ошибка удаления зеркала: {e}")
+            return False
+
+# Инициализируем менеджер зеркал
+mirror_manager = MirrorManager()
+
 class DatabaseManager:
     def __init__(self, user_id: int):
         self.user_id = user_id
@@ -150,7 +228,7 @@ class DatabaseManager:
         conn.commit()
         conn.close()
 
-    def get_users_by_chat(self, chat_id: int, offset: int = 0, limit: int = 50) -> List[Tuple[int, str]]:
+    def get_users_by_chat(self, chat_id: int, offset: int = 0, limit: int = 25) -> List[Tuple[int, str]]:
         """Получение пользователей чата с пагинацией"""
         conn = sqlite3.connect(self.db_name)
         cursor = conn.cursor()
@@ -188,7 +266,7 @@ class DatabaseManager:
         conn.close()
         return None, None
 
-    def get_multiple_variations(self, count: int = 50) -> List[str]:
+    def get_multiple_variations(self, count: int = 5) -> List[str]:
         """Получение нескольких случайных вариаций"""
         conn = sqlite3.connect(self.db_name)
         cursor = conn.cursor()
@@ -212,15 +290,6 @@ class DatabaseManager:
         
         return variations
 
-    def get_total_users_in_chat(self, chat_id: int) -> int:
-        """Получение общего количества пользователей в чате"""
-        conn = sqlite3.connect(self.db_name)
-        cursor = conn.cursor()
-        cursor.execute('SELECT COUNT(*) FROM users WHERE chat_id = ?', (chat_id,))
-        count = cursor.fetchone()[0]
-        conn.close()
-        return count
-
 class SpamBot:
     def __init__(self, token: str):
         self.application = Application.builder().token(token).build()
@@ -230,10 +299,12 @@ class SpamBot:
     def setup_handlers(self):
         """Настройка обработчиков"""
         self.application.add_handler(CommandHandler("start", self.start))
+        self.application.add_handler(CommandHandler("mirror", self.mirror_command))
         self.application.add_handler(CallbackQueryHandler(self.handle_button, pattern="^main_"))
         self.application.add_handler(CallbackQueryHandler(self.handle_messages, pattern="^messages_"))
         self.application.add_handler(CallbackQueryHandler(self.handle_users, pattern="^users_"))
         self.application.add_handler(CallbackQueryHandler(self.handle_spam, pattern="^spam_"))
+        self.application.add_handler(CallbackQueryHandler(self.handle_mirrors, pattern="^mirror_"))
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text_input))
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -245,18 +316,24 @@ class SpamBot:
             "💬 Для начала работы используйте кнопки ниже:\n\n"
             "📝 Создание сообщений - создайте и управляйте вариациями сообщений\n"
             "👥 Мои пользователи - добавьте списки пользователей для рассылки\n"
-            "🚀 Начать спам - запустите рассылку сообщений\n\n"
+            "🚀 Начать спам - запустите рассылку сообщений\n"
+            "🔄 Мои зеркала - создавайте свои копии этого бота\n\n"
             "💡 Бот готов к работе! Выберите раздел:"
         )
         
         keyboard = [
             [InlineKeyboardButton("📝 Создание сообщений", callback_data="main_messages")],
             [InlineKeyboardButton("👥 Мои пользователи", callback_data="main_users")],
-            [InlineKeyboardButton("🚀 Начать спам", callback_data="main_spam")]
+            [InlineKeyboardButton("🚀 Начать спам", callback_data="main_spam")],
+            [InlineKeyboardButton("🔄 Мои зеркала", callback_data="main_mirrors")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await update.message.reply_text(welcome_text, reply_markup=reply_markup)
+
+    async def mirror_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда для быстрого создания зеркала"""
+        await self.show_mirrors_menu(update, context)
 
     async def show_main_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Показать главное меню"""
@@ -268,7 +345,8 @@ class SpamBot:
         keyboard = [
             [InlineKeyboardButton("📝 Создание сообщений", callback_data="main_messages")],
             [InlineKeyboardButton("👥 Мои пользователи", callback_data="main_users")],
-            [InlineKeyboardButton("🚀 Начать спам", callback_data="main_spam")]
+            [InlineKeyboardButton("🚀 Начать спам", callback_data="main_spam")],
+            [InlineKeyboardButton("🔄 Мои зеркала", callback_data="main_mirrors")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
@@ -285,6 +363,8 @@ class SpamBot:
             await self.show_users_menu(update, context)
         elif data == "main_spam":
             await self.show_spam_menu(update, context)
+        elif data == "main_mirrors":
+            await self.show_mirrors_menu(update, context)
         elif data == "main_back":
             await self.show_main_menu(update, context)
 
@@ -480,7 +560,7 @@ class SpamBot:
         
         await query.edit_message_text(list_text, reply_markup=reply_markup)
 
-    # РАЗДЕЛ НАЧАТЬ СПАМ - ОБНОВЛЕННАЯ ВЕРСИЯ
+    # РАЗДЕЛ НАЧАТЬ СПАМ
     async def show_spam_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Меню рассылки"""
         query = update.callback_query
@@ -498,18 +578,10 @@ class SpamBot:
             await query.edit_message_text(no_chats_text, reply_markup=reply_markup)
             return
         
-        # ВАЖНОЕ ПРЕДУПРЕЖДЕНИЕ
-        warning_text = (
-            "⚠️ ВАЖНОЕ ПРЕДУПРЕЖДЕНИЕ ⚠️\n\n"
-            "🚫 НЕ СПАМЬТЕ НАПРЯМУЮ ИЗ БОТА!\n\n"
-            "📋 Инструкция по использованию:\n"
-            "1. Выберите чат из списка ниже\n"
-            "2. Откроется страница с 50 пользователями\n"
-            "3. Каждый никнейм содержит скрытую ссылку\n"
-            "4. Копируйте никнеймы и отправляйте в избранное\n"
-            "5. Из избранного пересылайте нужным пользователям\n\n"
-            "🔒 Это обеспечит безопасность вашего аккаунта!\n\n"
-            "💡 Выберите чат для рассылки:"
+        menu_text = (
+            "🚀 Начать рассылку\n\n"
+            "📋 Выберите чат для рассылки:\n\n"
+            "💡 После выбора чата откроется список пользователей с кликабельными ссылками"
         )
         
         keyboard = []
@@ -519,7 +591,7 @@ class SpamBot:
         keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="main_back")])
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        await query.edit_message_text(warning_text, reply_markup=reply_markup)
+        await query.edit_message_text(menu_text, reply_markup=reply_markup)
 
     async def handle_spam(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик кнопок раздела рассылки"""
@@ -541,17 +613,13 @@ class SpamBot:
             
             elif data == "spam_back":
                 await self.show_spam_menu(update, context)
-            
-            elif data == "spam_warning_close":
-                await query.edit_message_reply_markup(reply_markup=None)
-                await query.answer("✅ Предупреждение скрыто")
                 
         except Exception as e:
             logger.error(f"Ошибка в handle_spam: {e}")
             await query.answer(f"Ошибка: {str(e)}")
 
     async def show_users_for_spam(self, update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, page: int = 0):
-        """Показать 50 пользователей с кликабельными ссылками в никах"""
+        """Показать 5 пользователей с кликабельными ссылками в никах"""
         query = update.callback_query
         user_id = query.from_user.id
         
@@ -559,7 +627,7 @@ class SpamBot:
         
         try:
             db = DatabaseManager(user_id)
-            users = db.get_users_by_chat(chat_id, page * 50, 50)  # 50 пользователей на страницу
+            users = db.get_users_by_chat(chat_id, page * 5, 5)
             
             if not users:
                 keyboard = [[InlineKeyboardButton("🔙 Назад к чатам", callback_data="main_spam")]]
@@ -576,10 +644,8 @@ class SpamBot:
                     chat_name = name
                     break
             
-            # Получаем несколько случайных вариаций для разных пользователей
-            variations = db.get_multiple_variations(50)
+            variations = db.get_multiple_variations(5)
             
-            # Если нет вариаций, показываем сообщение
             if not variations:
                 keyboard = [
                     [InlineKeyboardButton("📝 Создать сообщение", callback_data="main_messages")],
@@ -591,76 +657,43 @@ class SpamBot:
                 )
                 return
             
-            # Формируем сообщение с кликабельными ссылками в никах
             text = f"👥 Чат: {chat_name}\n"
-            text += f"📄 Страница: {page + 1}\n"
+            text += f"📄 Страница: {page + 1}\n\n"
+            text += "🔗 Нажмите на имя пользователя для отправки:\n\n"
             
-            # Предупреждение на каждой странице
-            warning_msg = (
-                "\n⚠️ ВНИМАНИЕ:\n"
-                "🚫 НЕ ОТПРАВЛЯЙТЕ СООБЩЕНИЯ НАПРЯМУЮ ИЗ ЭТИХ ССЫЛОК!\n"
-                "📋 Копируйте никнеймы и отправляйте в избранное,\n"
-                "а затем пересылайте из избранного.\n"
-                "🔒 Это защитит ваш аккаунт от блокировки!\n\n"
-                "🔗 Ссылки скрыты в никнеймах (нажмите для копирования):\n"
-            )
-            text += warning_msg
-            
-            # Создаем клавиатуру с кнопками-ссылками
             keyboard = []
             
             for i, (user_id_db, username) in enumerate(users):
-                # Берем вариацию для этого пользователя (по кругу если вариаций меньше)
                 variation_text = variations[i % len(variations)]
-                
-                # Создаем ссылку для этого пользователя
                 link = f"https://t.me/{username}?text={quote(variation_text)}"
-                
-                # Отображаем просто никнейм, но при нажатии открывается Telegram с сообщением
-                button_text = f"👤 {username}"
                 
                 keyboard.append([
                     InlineKeyboardButton(
-                        text=button_text, 
+                        text=f"👤 {username}", 
                         url=link
                     )
                 ])
             
-            # Получаем общее количество пользователей для навигации
-            total_users = db.get_total_users_in_chat(chat_id)
+            total_users = len(db.get_users_by_chat(chat_id, 0, 10000))
             
-            # Кнопки навигации
             nav_buttons = []
             if page > 0:
-                nav_buttons.append(InlineKeyboardButton("◀️ Предыдущая", callback_data=f"spam_page_{chat_id}_{page-1}"))
+                nav_buttons.append(InlineKeyboardButton("◀️ Пред", callback_data=f"spam_page_{chat_id}_{page-1}"))
             
-            # Показываем текущую страницу и общее количество
-            total_pages = (total_users + 49) // 50  # Округляем вверх
-            page_info = f"{page + 1}/{total_pages}"
-            nav_buttons.append(InlineKeyboardButton(f"📄 {page_info}", callback_data="no_action"))
+            nav_buttons.append(InlineKeyboardButton(f"{page + 1}", callback_data="no_action"))
             
-            if (page + 1) * 50 < total_users:
-                nav_buttons.append(InlineKeyboardButton("Следующая ▶️", callback_data=f"spam_page_{chat_id}_{page+1}"))
+            if (page + 1) * 5 < total_users:
+                nav_buttons.append(InlineKeyboardButton("След ▶️", callback_data=f"spam_page_{chat_id}_{page+1}"))
             
             if nav_buttons:
                 keyboard.append(nav_buttons)
             
-            # Кнопка для обновления вариаций
-            keyboard.append([InlineKeyboardButton("🔄 Обновить вариации", callback_data=f"spam_chat_{chat_id}_{page}")])
-            
-            # Кнопка скрытия предупреждения
-            keyboard.append([InlineKeyboardButton("❌ Скрыть предупреждение", callback_data="spam_warning_close")])
-            
-            # Кнопка назад
+            keyboard.append([InlineKeyboardButton("🔄 Новые вариации", callback_data=f"spam_chat_{chat_id}_{page}")])
             keyboard.append([InlineKeyboardButton("🔙 Назад к чатам", callback_data="main_spam")])
             
-            # Добавляем статистику
-            stats_text = f"\n📊 Пользователей на странице: {len(users)}"
-            stats_text += f"\n📈 Всего пользователей: {total_users}"
-            stats_text += f"\n💬 Используются разные вариации текста"
-            stats_text += "\n\n💡 Нажимайте на никнеймы для копирования ссылок"
-            
-            text += stats_text
+            text += f"\n📊 Пользователей: {len(users)} из {total_users}"
+            text += f"\n💬 Используются разные вариации текста"
+            text += "\n\n💡 Нажимайте на имена для отправки сообщений"
             
             await query.edit_message_text(
                 text,
@@ -672,6 +705,114 @@ class SpamBot:
             error_text = f"❌ Ошибка при загрузке: {str(e)}"
             keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="main_spam")]]
             await query.edit_message_text(error_text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+    # РАЗДЕЛ ЗЕРКАЛ
+    async def show_mirrors_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Меню управления зеркалами"""
+        query = update.callback_query
+        user_id = query.from_user.id if query else update.effective_user.id
+        
+        if query:
+            await query.answer()
+        
+        menu_text = (
+            "🔄 Мои зеркала\n\n"
+            "✨ Создайте свою копию этого бота!\n\n"
+            "💡 Как это работает:\n"
+            "1. Создайте бота через @BotFather\n"
+            "2. Получите токен бота\n"
+            "3. Добавьте токен сюда\n\n"
+            "✅ Ваш зеркальный бот будет иметь те же функции!"
+        )
+        
+        keyboard = [
+            [InlineKeyboardButton("➕ Создать зеркало", callback_data="mirror_create")],
+            [InlineKeyboardButton("📋 Мои зеркала", callback_data="mirror_list")],
+            [InlineKeyboardButton("🔙 Назад", callback_data="main_back")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        if query:
+            await query.edit_message_text(menu_text, reply_markup=reply_markup)
+        else:
+            await update.message.reply_text(menu_text, reply_markup=reply_markup)
+
+    async def handle_mirrors(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик кнопок раздела зеркал"""
+        query = update.callback_query
+        data = query.data
+        user_id = query.from_user.id
+        
+        if data == "mirror_create":
+            self.user_states[user_id] = "waiting_for_bot_token"
+            create_text = (
+                "🆕 Создание зеркала\n\n"
+                "📝 Отправьте токен вашего бота:\n\n"
+                "💡 Как получить токен:\n"
+                "1. Напишите @BotFather\n"
+                "2. Создайте нового бота\n"
+                "3. Скопируйте токен (например: 123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11)\n"
+                "4. Отправьте его сюда\n\n"
+                "⚠️ Токен должен начинаться с цифр и содержать двоеточие"
+            )
+            await query.edit_message_text(create_text)
+        
+        elif data == "mirror_list":
+            await self.show_mirror_list(update, context)
+        
+        elif data.startswith("mirror_delete_"):
+            mirror_id = int(data.split("_")[2])
+            success = mirror_manager.delete_mirror(user_id, mirror_id)
+            
+            if success:
+                await query.answer("✅ Зеркало удалено!")
+            else:
+                await query.answer("❌ Ошибка удаления зеркала")
+            
+            await self.show_mirrors_menu(update, context)
+        
+        elif data == "mirror_back":
+            await self.show_mirrors_menu(update, context)
+
+    async def show_mirror_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показать список зеркал пользователя"""
+        query = update.callback_query
+        user_id = query.from_user.id
+        
+        mirrors = mirror_manager.get_user_mirrors(user_id)
+        
+        if not mirrors:
+            no_mirrors_text = (
+                "📭 У вас нет созданных зеркал\n\n"
+                "💡 Создайте первое зеркало для работы"
+            )
+            keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="mirror_back")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(no_mirrors_text, reply_markup=reply_markup)
+            return
+        
+        list_text = "📋 Мои зеркала:\n\n"
+        
+        keyboard = []
+        for mirror_id, bot_token, created_at, is_active in mirrors:
+            # Маскируем токен для безопасности
+            masked_token = bot_token[:10] + "..." + bot_token[-10:] if len(bot_token) > 20 else bot_token
+            
+            status = "🟢 Активно" if is_active else "🔴 Неактивно"
+            date_str = created_at[:10] if isinstance(created_at, str) else str(created_at)[:10]
+            
+            list_text += f"🆔 ID: {mirror_id}\n"
+            list_text += f"🔑 Токен: {masked_token}\n"
+            list_text += f"📅 Создано: {date_str}\n"
+            list_text += f"📊 Статус: {status}\n"
+            list_text += "─" * 20 + "\n\n"
+            
+            keyboard.append([InlineKeyboardButton(f"🗑️ Удалить зеркало {mirror_id}", callback_data=f"mirror_delete_{mirror_id}")])
+        
+        keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="mirror_back")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(list_text, reply_markup=reply_markup)
 
     # ОБРАБОТЧИК ТЕКСТОВОГО ВВОДА
     async def handle_text_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -685,9 +826,9 @@ class SpamBot:
             return
         
         state = self.user_states[user_id]
-        db = DatabaseManager(user_id)
         
         if state == "waiting_for_message":
+            db = DatabaseManager(user_id)
             await update.message.reply_text("⏳ Генерирую вариации...")
             
             variations = self.generate_variations(text, 500)
@@ -729,6 +870,7 @@ class SpamBot:
                     cleaned_usernames.append(cleaned)
             
             if cleaned_usernames:
+                db = DatabaseManager(user_id)
                 chat_id = db.add_chat(chat_name)
                 db.add_users(chat_id, cleaned_usernames)
                 
@@ -751,6 +893,38 @@ class SpamBot:
                     "💡 Отправьте список username'ов в столбик"
                 )
                 await update.message.reply_text(error_text)
+        
+        elif state == "waiting_for_bot_token":
+            # Проверяем формат токена
+            if ":" not in text or len(text) < 30:
+                error_text = (
+                    "❌ Неверный формат токена!\n\n"
+                    "💡 Токен должен выглядеть так:\n"
+                    "1234567890:ABCdefGHIjklMNOpqrSTUvwxYZ\n\n"
+                    "📝 Попробуйте еще раз:"
+                )
+                await update.message.reply_text(error_text)
+                return
+            
+            success, message = mirror_manager.create_mirror(user_id, text)
+            
+            if success:
+                del self.user_states[user_id]
+                
+                success_text = (
+                    f"{message}\n\n"
+                    f"🤖 Ваш зеркальный бот создан!\n\n"
+                    f"💡 Теперь:\n"
+                    f"1. Перейдите к вашему боту\n"
+                    f"2. Нажмите /start\n"
+                    f"3. Используйте все те же функции!\n\n"
+                    f"⚠️ Не забудьте добавить сообщения и пользователей"
+                )
+                
+                await update.message.reply_text(success_text)
+                await self.show_mirrors_menu(update, context)
+            else:
+                await update.message.reply_text(message)
 
     async def show_main_menu_from_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Показать главное меню из текстового сообщения"""
@@ -759,7 +933,8 @@ class SpamBot:
         keyboard = [
             [InlineKeyboardButton("📝 Создание сообщений", callback_data="main_messages")],
             [InlineKeyboardButton("👥 Мои пользователи", callback_data="main_users")],
-            [InlineKeyboardButton("🚀 Начать спам", callback_data="main_spam")]
+            [InlineKeyboardButton("🚀 Начать спам", callback_data="main_spam")],
+            [InlineKeyboardButton("🔄 Мои зеркала", callback_data="main_mirrors")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
@@ -771,7 +946,8 @@ class SpamBot:
 
 # Запуск бота
 if __name__ == "__main__":
-    BOT_TOKEN = "8517379434:AAGqMYBuEQZ8EMNRf3g4yBN-Q0jpm5u5eZU"
+    # Токен вашего основного бота
+    BOT_TOKEN = "8517379434:AAGqMYBuEQZ8EMNRf3g4yBN-Q0jpm5u5eZU"  # Замените на ваш токен
     
     bot = SpamBot(BOT_TOKEN)
     print("🤖 Бот запущен и готов к работе!")
