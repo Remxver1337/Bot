@@ -1,13 +1,9 @@
 import logging
 import sqlite3
 import random
-import asyncio
 import threading
 from typing import Dict, List, Tuple
 from urllib.parse import quote
-import os
-import json
-from datetime import datetime
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
@@ -19,60 +15,136 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Глобальный словарь для хранения активных ботов
-active_bots = {}
-user_bots_db = "user_bots.db"
-
-# Инициализация базы данных для хранения информации о ботах пользователей
-def init_user_bots_db():
-    """Инициализация базы данных пользовательских ботов"""
-    conn = sqlite3.connect(user_bots_db)
-    cursor = conn.cursor()
-    
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS user_bots (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            bot_token TEXT NOT NULL UNIQUE,
-            bot_username TEXT,
-            status TEXT DEFAULT 'active',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS bot_settings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            bot_token TEXT NOT NULL,
-            setting_name TEXT NOT NULL,
-            setting_value TEXT,
-            UNIQUE(bot_token, setting_name)
-        )
-    ''')
-    
-    conn.commit()
-    conn.close()
-
-init_user_bots_db()
-
 # Словарь для замены кириллических букв на латинские
 REPLACEMENTS = {
     'а': 'a', 'с': 'c', 'о': 'o', 'р': 'p', 'е': 'e', 'х': 'x', 'у': 'y',
     'А': 'A', 'С': 'C', 'О': 'O', 'Р': 'P', 'Е': 'E', 'Х': 'X', 'У': 'Y'
 }
 
-class DatabaseManager:
+# Глобальные переменные
+ACTIVE_USER_BOTS = {}  # token -> UserBot instance
+USER_BOTS_DB = "user_bots.db"
+
+# ==================== КЛАСС БАЗЫ ДАННЫХ ДЛЯ ЗЕРКАЛА ====================
+
+class MirrorDatabase:
+    """База данных для управления пользовательскими ботами"""
+    
+    def __init__(self):
+        self.db_name = USER_BOTS_DB
+        self.init_database()
+    
+    def init_database(self):
+        """Инициализация базы данных"""
+        conn = sqlite3.connect(self.db_name)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_bots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                bot_token TEXT NOT NULL UNIQUE,
+                bot_username TEXT,
+                status TEXT DEFAULT 'active',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        conn.commit()
+        conn.close()
+        logger.info("База данных зеркала инициализирована")
+    
+    def add_user_bot(self, user_id: int, bot_token: str, bot_username: str = None):
+        """Добавление пользовательского бота"""
+        conn = sqlite3.connect(self.db_name)
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute('''
+                INSERT INTO user_bots (user_id, bot_token, bot_username)
+                VALUES (?, ?, ?)
+            ''', (user_id, bot_token, bot_username))
+            
+            conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+        finally:
+            conn.close()
+    
+    def get_user_bots(self, user_id: int):
+        """Получение ботов пользователя"""
+        conn = sqlite3.connect(self.db_name)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT id, bot_token, bot_username, status, created_at
+            FROM user_bots 
+            WHERE user_id = ?
+            ORDER BY created_at DESC
+        ''', (user_id,))
+        
+        bots = cursor.fetchall()
+        conn.close()
+        return bots
+    
+    def get_all_bots(self):
+        """Получение всех ботов (для админа)"""
+        conn = sqlite3.connect(self.db_name)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT user_id, bot_token, bot_username, status, created_at
+            FROM user_bots 
+            ORDER BY created_at DESC
+        ''')
+        
+        bots = cursor.fetchall()
+        conn.close()
+        return bots
+    
+    def update_bot_status(self, bot_token: str, status: str):
+        """Обновление статуса бота"""
+        conn = sqlite3.connect(self.db_name)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            UPDATE user_bots 
+            SET status = ?
+            WHERE bot_token = ?
+        ''', (status, bot_token))
+        
+        conn.commit()
+        conn.close()
+    
+    def delete_bot(self, bot_token: str):
+        """Удаление бота"""
+        conn = sqlite3.connect(self.db_name)
+        cursor = conn.cursor()
+        
+        cursor.execute('DELETE FROM user_bots WHERE bot_token = ?', (bot_token,))
+        
+        conn.commit()
+        deleted = cursor.rowcount > 0
+        conn.close()
+        return deleted
+
+# ==================== КЛАСС БАЗЫ ДАННЫХ ПОЛЬЗОВАТЕЛЬСКОГО БОТА ====================
+
+class UserDatabase:
+    """База данных для каждого пользовательского бота"""
+    
     def __init__(self, user_id: int):
         self.user_id = user_id
         self.db_name = f"user_{user_id}.db"
         self.init_database()
-
+    
     def init_database(self):
-        """Инициализация базы данных для пользователя"""
+        """Инициализация базы данных пользователя"""
         conn = sqlite3.connect(self.db_name)
         cursor = conn.cursor()
         
+        # Таблица сообщений
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -81,6 +153,7 @@ class DatabaseManager:
             )
         ''')
         
+        # Таблица вариаций
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS variations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -91,6 +164,7 @@ class DatabaseManager:
             )
         ''')
         
+        # Таблица чатов
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS chats (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -98,6 +172,7 @@ class DatabaseManager:
             )
         ''')
         
+        # Таблица пользователей
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -109,7 +184,8 @@ class DatabaseManager:
         
         conn.commit()
         conn.close()
-
+    
+    # Методы для работы с сообщениями
     def add_message(self, original_text: str) -> int:
         """Добавление исходного сообщения"""
         conn = sqlite3.connect(self.db_name)
@@ -119,7 +195,7 @@ class DatabaseManager:
         conn.commit()
         conn.close()
         return message_id
-
+    
     def add_variations(self, message_id: int, variations: List[str]):
         """Добавление вариаций сообщения"""
         conn = sqlite3.connect(self.db_name)
@@ -130,7 +206,7 @@ class DatabaseManager:
         )
         conn.commit()
         conn.close()
-
+    
     def get_messages(self) -> List[Tuple[int, str]]:
         """Получение списка исходных сообщений"""
         conn = sqlite3.connect(self.db_name)
@@ -139,7 +215,7 @@ class DatabaseManager:
         messages = cursor.fetchall()
         conn.close()
         return messages
-
+    
     def delete_message(self, message_id: int):
         """Удаление сообщения и всех его вариаций"""
         conn = sqlite3.connect(self.db_name)
@@ -148,7 +224,8 @@ class DatabaseManager:
         cursor.execute('DELETE FROM messages WHERE id = ?', (message_id,))
         conn.commit()
         conn.close()
-
+    
+    # Методы для работы с чатами
     def add_chat(self, chat_name: str) -> int:
         """Добавление чата"""
         conn = sqlite3.connect(self.db_name)
@@ -162,7 +239,7 @@ class DatabaseManager:
         conn.commit()
         conn.close()
         return chat_id
-
+    
     def add_users(self, chat_id: int, usernames: List[str]):
         """Добавление пользователей в чат"""
         conn = sqlite3.connect(self.db_name)
@@ -173,7 +250,7 @@ class DatabaseManager:
         )
         conn.commit()
         conn.close()
-
+    
     def get_chats(self) -> List[Tuple[int, str]]:
         """Получение списка чатов"""
         conn = sqlite3.connect(self.db_name)
@@ -182,7 +259,7 @@ class DatabaseManager:
         chats = cursor.fetchall()
         conn.close()
         return chats
-
+    
     def delete_chat(self, chat_id: int):
         """Удаление чата и всех его пользователей"""
         conn = sqlite3.connect(self.db_name)
@@ -191,7 +268,7 @@ class DatabaseManager:
         cursor.execute('DELETE FROM chats WHERE id = ?', (chat_id,))
         conn.commit()
         conn.close()
-
+    
     def get_users_by_chat(self, chat_id: int, offset: int = 0, limit: int = 25) -> List[Tuple[int, str]]:
         """Получение пользователей чата с пагинацией"""
         conn = sqlite3.connect(self.db_name)
@@ -203,7 +280,17 @@ class DatabaseManager:
         users = cursor.fetchall()
         conn.close()
         return users
-
+    
+    def get_total_users_in_chat(self, chat_id: int) -> int:
+        """Получение общего количества пользователей в чате"""
+        conn = sqlite3.connect(self.db_name)
+        cursor = conn.cursor()
+        cursor.execute('SELECT COUNT(*) FROM users WHERE chat_id = ?', (chat_id,))
+        count = cursor.fetchone()[0]
+        conn.close()
+        return count
+    
+    # Методы для работы с вариациями
     def get_random_variation(self) -> Tuple[int, str]:
         """Получение случайной вариации сообщения"""
         conn = sqlite3.connect(self.db_name)
@@ -229,7 +316,7 @@ class DatabaseManager:
         
         conn.close()
         return None, None
-
+    
     def get_multiple_variations(self, count: int = 5) -> List[str]:
         """Получение нескольких случайных вариаций"""
         conn = sqlite3.connect(self.db_name)
@@ -254,22 +341,26 @@ class DatabaseManager:
         
         return variations
 
-class UserSpamBot:
+# ==================== КЛАСС ПОЛЬЗОВАТЕЛЬСКОГО БОТА ====================
+
+class UserBot:
     """Класс для пользовательского бота"""
+    
     def __init__(self, token: str, owner_id: int):
         self.token = token
         self.owner_id = owner_id
+        self.db = UserDatabase(owner_id)
         self.application = None
         self.user_states = {}
         
-    async def initialize(self):
+    def initialize(self) -> bool:
         """Инициализация бота"""
         try:
             self.application = Application.builder().token(self.token).build()
             self.setup_handlers()
             return True
         except Exception as e:
-            logger.error(f"Ошибка инициализации бота {self.token}: {e}")
+            logger.error(f"Ошибка инициализации пользовательского бота: {e}")
             return False
     
     def setup_handlers(self):
@@ -280,7 +371,8 @@ class UserSpamBot:
         self.application.add_handler(CallbackQueryHandler(self.handle_users, pattern="^users_"))
         self.application.add_handler(CallbackQueryHandler(self.handle_spam, pattern="^spam_"))
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text_input))
-
+    
+    # Основные команды
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик команды /start"""
         user_id = update.effective_user.id
@@ -289,12 +381,12 @@ class UserSpamBot:
         if user_id != self.owner_id:
             await update.message.reply_text(
                 "🚫 Этот бот принадлежит другому пользователю.\n"
-                "Для создания своего бота обратитесь к @YourMainBot"
+                "Для создания своего бота обратитесь к основному боту-зеркалу."
             )
             return
         
         welcome_text = (
-            "🌟 Добро пожаловать в ваш персональный бот! 🌟\n\n"
+            "🌟 Добро пожаловать в ваш персональный спам-бот! 🌟\n\n"
             "💬 Для начала работы используйте кнопки ниже:\n\n"
             "📝 Создание сообщений - создайте и управляйте вариациями сообщений\n"
             "👥 Мои пользователи - добавьте списки пользователей для рассылки\n"
@@ -310,7 +402,7 @@ class UserSpamBot:
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await update.message.reply_text(welcome_text, reply_markup=reply_markup)
-
+    
     async def show_main_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Показать главное меню"""
         query = update.callback_query
@@ -326,7 +418,7 @@ class UserSpamBot:
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await query.edit_message_text(menu_text, reply_markup=reply_markup)
-
+    
     async def handle_button(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик кнопок главного меню"""
         query = update.callback_query
@@ -340,8 +432,8 @@ class UserSpamBot:
             await self.show_spam_menu(update, context)
         elif data == "main_back":
             await self.show_main_menu(update, context)
-
-    # РАЗДЕЛ СОЗДАНИЯ СООБЩЕНИЙ
+    
+    # Раздел создания сообщений
     async def show_messages_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Меню создания сообщений"""
         query = update.callback_query
@@ -363,15 +455,14 @@ class UserSpamBot:
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await query.edit_message_text(menu_text, reply_markup=reply_markup)
-
+    
     async def handle_messages(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик кнопок раздела сообщений"""
         query = update.callback_query
         data = query.data
-        user_id = query.from_user.id
         
         if data == "messages_create":
-            self.user_states[user_id] = "waiting_for_message"
+            self.user_states[self.owner_id] = "waiting_for_message"
             create_text = (
                 "🆕 Создание нового сообщения\n\n"
                 "📨 Введите исходное сообщение для создания вариаций:\n\n"
@@ -384,20 +475,17 @@ class UserSpamBot:
         
         elif data.startswith("messages_delete_"):
             message_id = int(data.split("_")[2])
-            db = DatabaseManager(self.owner_id)
-            db.delete_message(message_id)
+            self.db.delete_message(message_id)
             await query.answer("✅ Сообщение и все его вариации удалены!")
             await self.show_messages_menu(update, context)
         
         elif data == "messages_back":
             await self.show_messages_menu(update, context)
-
+    
     async def show_message_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Показать список сообщений для удаления"""
         query = update.callback_query
-        user_id = query.from_user.id
-        db = DatabaseManager(self.owner_id)
-        messages = db.get_messages()
+        messages = self.db.get_messages()
         
         if not messages:
             no_messages_text = (
@@ -424,7 +512,7 @@ class UserSpamBot:
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await query.edit_message_text(list_text, reply_markup=reply_markup)
-
+    
     def generate_variations(self, text: str, count: int = 500) -> List[str]:
         """Генерация вариаций сообщения"""
         variations = set()
@@ -449,8 +537,8 @@ class UserSpamBot:
                 break
         
         return list(variations)
-
-    # РАЗДЕЛ МОИХ ПОЛЬЗОВАТЕЛЕЙ
+    
+    # Раздел пользователей
     async def show_users_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Меню пользователей"""
         query = update.callback_query
@@ -472,15 +560,14 @@ class UserSpamBot:
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await query.edit_message_text(menu_text, reply_markup=reply_markup)
-
+    
     async def handle_users(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик кнопок раздела пользователей"""
         query = update.callback_query
         data = query.data
-        user_id = query.from_user.id
         
         if data == "users_add":
-            self.user_states[user_id] = "waiting_for_chat_name"
+            self.user_states[self.owner_id] = "waiting_for_chat_name"
             add_text = (
                 "➕ Добавление пользователей\n\n"
                 "🏷️ Напишите название чата из которого взяли пользователей:\n\n"
@@ -493,20 +580,17 @@ class UserSpamBot:
         
         elif data.startswith("users_delete_"):
             chat_id = int(data.split("_")[2])
-            db = DatabaseManager(self.owner_id)
-            db.delete_chat(chat_id)
+            self.db.delete_chat(chat_id)
             await query.answer("✅ Чат и все пользователи удалены!")
             await self.show_users_menu(update, context)
         
         elif data == "users_back":
             await self.show_users_menu(update, context)
-
+    
     async def show_chat_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Показать список чатов для удаления"""
         query = update.callback_query
-        user_id = query.from_user.id
-        db = DatabaseManager(self.owner_id)
-        chats = db.get_chats()
+        chats = self.db.get_chats()
         
         if not chats:
             no_chats_text = (
@@ -532,19 +616,17 @@ class UserSpamBot:
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await query.edit_message_text(list_text, reply_markup=reply_markup)
-
-    # РАЗДЕЛ НАЧАТЬ СПАМ
+    
+    # Раздел рассылки
     async def show_spam_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Меню рассылки"""
         query = update.callback_query
-        user_id = query.from_user.id
-        db = DatabaseManager(self.owner_id)
-        chats = db.get_chats()
+        chats = self.db.get_chats()
         
         if not chats:
             no_chats_text = (
                 "📭 У вас нет добавленных чатов\n\n"
-                "💡 Сначала добавьте пользователи в разделе \"👥 Мои пользователи\""
+                "💡 Сначала добавьте пользователей в разделе \"👥 Мои пользователи\""
             )
             keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="main_back")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
@@ -565,7 +647,7 @@ class UserSpamBot:
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await query.edit_message_text(menu_text, reply_markup=reply_markup)
-
+    
     async def handle_spam(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик кнопок раздела рассылки"""
         query = update.callback_query
@@ -590,14 +672,14 @@ class UserSpamBot:
         except Exception as e:
             logger.error(f"Ошибка в handle_spam: {e}")
             await query.answer(f"Ошибка: {str(e)}")
-
+    
     async def show_users_for_spam(self, update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, page: int = 0):
-        """Показать 5 пользователей с кликабельными ссылками в никах"""
+        """Показать пользователей для рассылки"""
         query = update.callback_query
+        await query.answer()
         
         try:
-            db = DatabaseManager(self.owner_id)
-            users = db.get_users_by_chat(chat_id, page * 5, 5)
+            users = self.db.get_users_by_chat(chat_id, page * 5, 5)
             
             if not users:
                 keyboard = [[InlineKeyboardButton("🔙 Назад к чатам", callback_data="main_spam")]]
@@ -607,15 +689,19 @@ class UserSpamBot:
                 )
                 return
             
+            # Получаем информацию о чате
+            chats = self.db.get_chats()
             chat_name = "Неизвестный чат"
-            chats = db.get_chats()
+            total_users = 0
+            
             for cid, name in chats:
                 if cid == chat_id:
                     chat_name = name
+                    total_users = self.db.get_total_users_in_chat(chat_id)
                     break
             
-            # Получаем несколько случайных вариаций
-            variations = db.get_multiple_variations(5)
+            # Получаем вариации сообщений
+            variations = self.db.get_multiple_variations(5)
             
             if not variations:
                 keyboard = [
@@ -628,14 +714,21 @@ class UserSpamBot:
                 )
                 return
             
+            # Формируем сообщение
             text = f"👥 Чат: {chat_name}\n"
-            text += f"📄 Страница: {page + 1}\n\n"
+            text += f"📄 Страница: {page + 1}\n"
+            text += f"📊 Всего пользователей: {total_users}\n\n"
             text += "🔗 Нажмите на имя пользователя для отправки:\n\n"
             
+            # Создаем клавиатуру
             keyboard = []
             
             for i, (user_id_db, username) in enumerate(users):
-                variation_text = variations[i % len(variations)]
+                # Берем вариацию для этого пользователя
+                variation_idx = i % len(variations)
+                variation_text = variations[variation_idx]
+                
+                # Создаем ссылку
                 link = f"https://t.me/{username}?text={quote(variation_text)}"
                 
                 keyboard.append([
@@ -645,8 +738,7 @@ class UserSpamBot:
                     )
                 ])
             
-            total_users = len(db.get_users_by_chat(chat_id, 0, 10000))
-            
+            # Кнопки навигации
             nav_buttons = []
             if page > 0:
                 nav_buttons.append(InlineKeyboardButton("◀️ Пред", callback_data=f"spam_page_{chat_id}_{page-1}"))
@@ -662,8 +754,7 @@ class UserSpamBot:
             keyboard.append([InlineKeyboardButton("🔄 Новые вариации", callback_data=f"spam_chat_{chat_id}_{page}")])
             keyboard.append([InlineKeyboardButton("🔙 Назад к чатам", callback_data="main_spam")])
             
-            text += f"\n📊 Пользователей: {len(users)} из {total_users}"
-            text += f"\n💬 Используются разные вариации текста"
+            text += f"💬 Используются разные вариации текста"
             text += "\n\n💡 Нажимайте на имена для отправки сообщений"
             
             await query.edit_message_text(
@@ -676,12 +767,13 @@ class UserSpamBot:
             error_text = f"❌ Ошибка при загрузке: {str(e)}"
             keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="main_spam")]]
             await query.edit_message_text(error_text, reply_markup=InlineKeyboardMarkup(keyboard))
-
-    # ОБРАБОТЧИК ТЕКСТОВОГО ВВОДА
+    
+    # Обработчик текстового ввода
     async def handle_text_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик текстового ввода"""
         user_id = update.message.from_user.id
         
+        # Проверяем владельца
         if user_id != self.owner_id:
             await update.message.reply_text("🚫 У вас нет доступа к этому боту.")
             return
@@ -694,14 +786,13 @@ class UserSpamBot:
             return
         
         state = self.user_states[user_id]
-        db = DatabaseManager(self.owner_id)
         
         if state == "waiting_for_message":
             await update.message.reply_text("⏳ Генерирую вариации...")
             
             variations = self.generate_variations(text, 500)
-            message_id = db.add_message(text)
-            db.add_variations(message_id, variations)
+            message_id = self.db.add_message(text)
+            self.db.add_variations(message_id, variations)
             
             del self.user_states[user_id]
             
@@ -738,8 +829,8 @@ class UserSpamBot:
                     cleaned_usernames.append(cleaned)
             
             if cleaned_usernames:
-                chat_id = db.add_chat(chat_name)
-                db.add_users(chat_id, cleaned_usernames)
+                chat_id = self.db.add_chat(chat_name)
+                self.db.add_users(chat_id, cleaned_usernames)
                 
                 del self.user_states[user_id]
                 if 'current_chat_name' in context.user_data:
@@ -760,7 +851,7 @@ class UserSpamBot:
                     "💡 Отправьте список username'ов в столбик"
                 )
                 await update.message.reply_text(error_text)
-
+    
     async def show_main_menu_from_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Показать главное меню из текстового сообщения"""
         menu_text = "🎯 Главное меню\n\n💡 Выберите нужный раздел:"
@@ -773,203 +864,204 @@ class UserSpamBot:
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await update.message.reply_text(menu_text, reply_markup=reply_markup)
-
+    
     def run(self):
         """Запуск бота в отдельном потоке"""
         try:
             self.application.run_polling()
         except Exception as e:
-            logger.error(f"Ошибка в боте {self.token}: {e}")
+            logger.error(f"Ошибка в пользовательском боте: {e}")
+
+# ==================== КЛАСС ОСНОВНОГО БОТА-ЗЕРКАЛА ====================
 
 class MirrorBot:
     """Основной бот для создания зеркал"""
+    
     def __init__(self, token: str):
         self.token = token
         self.application = Application.builder().token(token).build()
+        self.mirror_db = MirrorDatabase()
         self.user_states = {}
         self.setup_handlers()
-
+    
     def setup_handlers(self):
         """Настройка обработчиков основного бота"""
         self.application.add_handler(CommandHandler("start", self.start))
-        self.application.add_handler(CommandHandler("create_bot", self.create_bot))
-        self.application.add_handler(CommandHandler("my_bots", self.my_bots))
-        self.application.add_handler(CommandHandler("stop_bot", self.stop_bot))
-        self.application.add_handler(CallbackQueryHandler(self.handle_callback))
-        self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text_input))
-
+        self.application.add_handler(CommandHandler("create", self.create_bot))
+        self.application.add_handler(CommandHandler("mybots", self.my_bots))
+        self.application.add_handler(CommandHandler("stop", self.stop_bot))
+        self.application.add_handler(CommandHandler("admin", self.admin_panel))
+        self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text))
+    
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик команды /start"""
         user_id = update.effective_user.id
         
         welcome_text = (
-            "🤖 Добро пожаловать в Mirror Bot Creator! 🤖\n\n"
-            "✨ Этот бот поможет вам создать собственного спам-бота!\n\n"
-            "📋 Доступные команды:\n"
-            "• /create_bot - Создать нового бота\n"
-            "• /my_bots - Просмотреть моих ботов\n"
-            "• /stop_bot - Остановить бота\n\n"
-            "💡 Как это работает:\n"
-            "1. Создайте бота через @BotFather\n"
-            "2. Получите токен бота\n"
-            "3. Используйте /create_bot с токеном\n"
-            "4. Получите готового спам-бота!"
+            "🤖 **Добро пожаловать в Mirror Bot Creator!** 🤖\n\n"
+            "✨ **Создайте своего собственного спам-бота за 3 шага:**\n\n"
+            "1️⃣ Создайте бота через @BotFather\n"
+            "2️⃣ Получите токен бота (формат: 1234567890:ABCdefGHIjkl...)\n"
+            "3️⃣ Используйте команду /create с токеном\n\n"
+            "📋 **Доступные команды:**\n"
+            "• /create [token] - Создать нового бота\n"
+            "• /mybots - Показать моих ботов\n"
+            "• /stop [номер] - Остановить бота\n"
+            "• /admin - Панель администратора\n\n"
+            "💡 **Ваш бот получит все функции оригинального спам-бота:**\n"
+            "• 📝 Создание сообщений с вариациями\n"
+            "• 👥 Управление списками пользователей\n"
+            "• 🚀 Массовая рассылка\n"
+            "• 📊 Статистика\n\n"
+            "👇 **Чтобы начать, создайте бота в @BotFather и используйте /create**"
         )
         
-        await update.message.reply_text(welcome_text)
-
+        await update.message.reply_text(welcome_text, parse_mode='Markdown')
+    
     async def create_bot(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Создание нового бота"""
+        """Создание нового пользовательского бота"""
         user_id = update.effective_user.id
         
         if len(context.args) < 1:
             instruction_text = (
-                "📝 Для создания бота выполните следующие шаги:\n\n"
-                "1. Создайте бота через @BotFather\n"
-                "2. Получите токен (выглядит как: 1234567890:ABCdefGHIjklMNOpqrsTUVwxyz)\n"
-                "3. Отправьте команду:\n"
-                "   /create_bot YOUR_BOT_TOKEN\n\n"
-                "⚠️ Важно: Никому не передавайте токен вашего бота!"
+                "📝 **Как создать своего бота:**\n\n"
+                "1. Откройте @BotFather в Telegram\n"
+                "2. Отправьте команду /newbot\n"
+                "3. Выберите имя для бота\n"
+                "4. Выберите username для бота (должен заканчиваться на 'bot')\n"
+                "5. Получите токен (выглядит примерно так):\n"
+                "   1234567890:ABCdefGHIjklMNOpqrsTUVwxyz\n"
+                "6. Отправьте команду:\n"
+                "   /create 1234567890:ABCdefGHIjklMNOpqrsTUVwxyz\n\n"
+                "⚠️ **Внимание:** Никому не передавайте токен вашего бота!"
             )
-            await update.message.reply_text(instruction_text)
+            await update.message.reply_text(instruction_text, parse_mode='Markdown')
             return
         
-        bot_token = context.args[0]
+        bot_token = context.args[0].strip()
         
         try:
             # Проверяем токен
             test_app = Application.builder().token(bot_token).build()
+            await test_app.initialize()
             bot_info = await test_app.bot.get_me()
             bot_username = bot_info.username
             
-            # Сохраняем в базу данных
-            conn = sqlite3.connect(user_bots_db)
-            cursor = conn.cursor()
-            
-            # Проверяем, не существует ли уже такой бот
-            cursor.execute('SELECT id FROM user_bots WHERE bot_token = ?', (bot_token,))
-            if cursor.fetchone():
-                await update.message.reply_text("❌ Этот бот уже зарегистрирован!")
-                conn.close()
-                return
-            
-            # Добавляем бота в базу
-            cursor.execute(
-                'INSERT INTO user_bots (user_id, bot_token, bot_username) VALUES (?, ?, ?)',
-                (user_id, bot_token, bot_username)
-            )
-            conn.commit()
-            conn.close()
-            
-            # Создаем и запускаем бота
-            user_bot = UserSpamBot(bot_token, user_id)
-            if await user_bot.initialize():
-                # Запускаем в отдельном потоке
-                import threading
-                thread = threading.Thread(target=user_bot.run, daemon=True)
-                thread.start()
+            # Сохраняем бота в базу данных
+            if self.mirror_db.add_user_bot(user_id, bot_token, bot_username):
+                # Создаем пользовательский бот
+                user_bot = UserBot(bot_token, user_id)
                 
-                # Сохраняем ссылку на бота
-                active_bots[bot_token] = user_bot
-                
-                success_text = (
-                    f"✅ Бот успешно создан!\n\n"
-                    f"📝 Имя бота: @{bot_username}\n"
-                    f"👤 Владелец: Вы\n"
-                    f"🔄 Статус: Активен\n\n"
-                    f"💡 Теперь перейдите в @{bot_username} и используйте /start для управления ботом\n\n"
-                    f"⚠️ Не забудьте:\n"
-                    f"• Добавить сообщения в вашем боте\n"
-                    f"• Добавить пользователей для рассылки\n"
-                    f"• Начать рассылку"
-                )
-                
-                await update.message.reply_text(success_text)
+                if user_bot.initialize():
+                    # Запускаем в отдельном потоке
+                    thread = threading.Thread(target=user_bot.run, daemon=True)
+                    thread.start()
+                    
+                    # Сохраняем в глобальный словарь
+                    ACTIVE_USER_BOTS[bot_token] = user_bot
+                    
+                    success_text = (
+                        f"✅ **Бот успешно создан!**\n\n"
+                        f"🤖 **Имя бота:** @{bot_username}\n"
+                        f"👤 **Владелец:** Вы\n"
+                        f"🔄 **Статус:** Активен\n\n"
+                        f"💡 **Что делать дальше:**\n"
+                        f"1. Перейдите в @{bot_username}\n"
+                        f"2. Нажмите /start\n"
+                        f"3. Создайте сообщения\n"
+                        f"4. Добавьте пользователей\n"
+                        f"5. Начните рассылку!\n\n"
+                        f"⚠️ **Не забудьте:**\n"
+                        f"• Добавить сообщения в вашем боте\n"
+                        f"• Добавить пользователей для рассылки\n"
+                        f"• Начать рассылку через раздел 'Начать спам'"
+                    )
+                    
+                    await update.message.reply_text(success_text, parse_mode='Markdown')
+                else:
+                    await update.message.reply_text("❌ Не удалось инициализировать бота. Проверьте токен.")
             else:
-                await update.message.reply_text("❌ Не удалось инициализировать бота. Проверьте токен.")
+                await update.message.reply_text("❌ Этот бот уже зарегистрирован в системе!")
+                
+            await test_app.shutdown()
                 
         except Exception as e:
             logger.error(f"Ошибка создания бота: {e}")
-            await update.message.reply_text(f"❌ Ошибка: {str(e)}\n\nПроверьте токен бота.")
-
+            error_msg = str(e)
+            if "Unauthorized" in error_msg:
+                await update.message.reply_text("❌ Неверный токен бота. Проверьте токен и попробуйте снова.")
+            else:
+                await update.message.reply_text(f"❌ Ошибка: {error_msg}")
+    
     async def my_bots(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Показать список моих ботов"""
         user_id = update.effective_user.id
-        
-        conn = sqlite3.connect(user_bots_db)
-        cursor = conn.cursor()
-        cursor.execute(
-            'SELECT bot_token, bot_username, status, created_at FROM user_bots WHERE user_id = ?',
-            (user_id,)
-        )
-        bots = cursor.fetchall()
-        conn.close()
+        bots = self.mirror_db.get_user_bots(user_id)
         
         if not bots:
-            await update.message.reply_text("📭 У вас нет созданных ботов.\n\nИспользуйте /create_bot для создания первого бота.")
+            await update.message.reply_text(
+                "📭 **У вас нет созданных ботов.**\n\n"
+                "Используйте /create [токен] для создания первого бота.",
+                parse_mode='Markdown'
+            )
             return
         
-        bot_list_text = "🤖 Мои боты:\n\n"
+        bot_list_text = "🤖 **Мои боты:**\n\n"
         
-        for i, (token, username, status, created_at) in enumerate(bots, 1):
+        for i, (bot_id, token, username, status, created_at) in enumerate(bots, 1):
             bot_status = "🟢 Активен" if status == 'active' else "🔴 Остановлен"
             created_date = created_at.split()[0] if created_at else "Неизвестно"
             
-            bot_list_text += f"{i}. @{username}\n"
+            bot_list_text += f"**{i}. @{username}**\n"
             bot_list_text += f"   Статус: {bot_status}\n"
             bot_list_text += f"   Создан: {created_date}\n"
-            bot_list_text += f"   Токен: {token[:10]}...\n\n"
+            bot_list_text += f"   Токен: `{token[:10]}...`\n\n"
         
-        bot_list_text += "💡 Используйте /stop_bot [номер] для остановки бота"
+        bot_list_text += (
+            "💡 **Команды для управления:**\n"
+            "• /stop [номер] - остановить бота\n"
+            "• /create [токен] - добавить нового бота\n\n"
+            "⚠️ **Важно:** Токен показан не полностью для безопасности."
+        )
         
-        await update.message.reply_text(bot_list_text)
-
+        await update.message.reply_text(bot_list_text, parse_mode='Markdown')
+    
     async def stop_bot(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Остановить бота"""
+        """Остановить пользовательского бота"""
         user_id = update.effective_user.id
         
         if len(context.args) < 1:
             await update.message.reply_text(
                 "❌ Укажите номер бота для остановки.\n\n"
-                "Пример: /stop_bot 1\n\n"
-                "Используйте /my_bots чтобы увидеть список ваших ботов."
+                "**Пример:** /stop 1\n\n"
+                "Используйте /mybots чтобы увидеть список ваших ботов.",
+                parse_mode='Markdown'
             )
             return
         
         try:
             bot_num = int(context.args[0]) - 1
             
-            conn = sqlite3.connect(user_bots_db)
-            cursor = conn.cursor()
-            cursor.execute(
-                'SELECT bot_token, bot_username FROM user_bots WHERE user_id = ?',
-                (user_id,)
-            )
-            bots = cursor.fetchall()
+            bots = self.mirror_db.get_user_bots(user_id)
             
             if bot_num < 0 or bot_num >= len(bots):
                 await update.message.reply_text("❌ Неверный номер бота.")
-                conn.close()
                 return
             
-            bot_token, bot_username = bots[bot_num]
+            bot_id, bot_token, bot_username, status, created_at = bots[bot_num]
             
-            # Обновляем статус в базе
-            cursor.execute(
-                'UPDATE user_bots SET status = ? WHERE bot_token = ?',
-                ('stopped', bot_token)
-            )
-            conn.commit()
-            conn.close()
+            # Обновляем статус в базе данных
+            self.mirror_db.update_bot_status(bot_token, 'stopped')
             
-            # Останавливаем бота (в реальности нужно завершить его поток)
-            if bot_token in active_bots:
-                # В реальном приложении здесь нужно корректно остановить бота
-                del active_bots[bot_token]
+            # Удаляем из активных ботов
+            if bot_token in ACTIVE_USER_BOTS:
+                # В реальном приложении нужно корректно остановить бота
+                del ACTIVE_USER_BOTS[bot_token]
             
             await update.message.reply_text(
-                f"✅ Бот @{bot_username} остановлен.\n\n"
-                f"Для повторного запуска используйте /create_bot с тем же токеном."
+                f"✅ **Бот @{bot_username} остановлен.**\n\n"
+                f"Для повторного запуска используйте /create с тем же токеном.",
+                parse_mode='Markdown'
             )
             
         except ValueError:
@@ -977,58 +1069,114 @@ class MirrorBot:
         except Exception as e:
             logger.error(f"Ошибка остановки бота: {e}")
             await update.message.reply_text(f"❌ Ошибка: {str(e)}")
-
-    async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик callback-ов"""
-        query = update.callback_query
-        await query.answer()
-
-    async def handle_text_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик текстового ввода"""
-        await update.message.reply_text(
-            "💡 Используйте команды:\n\n"
-            "/create_bot - Создать нового бота\n"
-            "/my_bots - Просмотреть моих ботов\n"
-            "/stop_bot - Остановить бота\n\n"
-            "Для начала нажмите /start"
-        )
-
-    def load_existing_bots(self):
-        """Загрузка существующих ботов из базы данных при запуске"""
-        conn = sqlite3.connect(user_bots_db)
-        cursor = conn.cursor()
-        cursor.execute('SELECT user_id, bot_token FROM user_bots WHERE status = ?', ('active',))
-        active_bots_list = cursor.fetchall()
-        conn.close()
+    
+    async def admin_panel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Панель администратора"""
+        user_id = update.effective_user.id
         
-        for user_id, bot_token in active_bots_list:
-            try:
-                user_bot = UserSpamBot(bot_token, user_id)
-                if user_bot.initialize():
-                    thread = threading.Thread(target=user_bot.run, daemon=True)
-                    thread.start()
-                    active_bots[bot_token] = user_bot
-                    logger.info(f"Загружен бот для пользователя {user_id}")
-            except Exception as e:
-                logger.error(f"Ошибка загрузки бота {bot_token}: {e}")
-
+        # Проверяем права администратора (здесь можно добавить проверку)
+        # Для примепа, допустим администратор имеет ID 123456789
+        ADMIN_ID = 123456789  # Замените на ваш ID
+        
+        if user_id != ADMIN_ID:
+            await update.message.reply_text("🚫 У вас нет доступа к панели администратора.")
+            return
+        
+        # Получаем статистику
+        all_bots = self.mirror_db.get_all_bots()
+        active_bots_count = len(ACTIVE_USER_BOTS)
+        
+        admin_text = (
+            "👑 **Панель администратора**\n\n"
+            f"📊 **Статистика:**\n"
+            f"• Всего ботов в системе: {len(all_bots)}\n"
+            f"• Активных ботов: {active_bots_count}\n"
+            f"• Остановленных ботов: {len(all_bots) - active_bots_count}\n\n"
+            "📋 **Последние 10 ботов:**\n"
+        )
+        
+        for i, (owner_id, token, username, status, created_at) in enumerate(all_bots[:10], 1):
+            admin_text += f"{i}. @{username} (ID: {owner_id}) - {status}\n"
+        
+        if len(all_bots) > 10:
+            admin_text += f"\n... и еще {len(all_bots) - 10} ботов\n"
+        
+        admin_text += "\n💡 **Доступные действия:**\n"
+        admin_text += "• Просмотр статистики\n"
+        admin_text += "• Управление ботами\n"
+        
+        await update.message.reply_text(admin_text, parse_mode='Markdown')
+    
+    async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик текстовых сообщений"""
+        text = update.message.text
+        
+        # Если текст похож на токен бота (содержит двоеточие)
+        if ':' in text and len(text) > 30:
+            # Предлагаем создать бота
+            keyboard = [[InlineKeyboardButton("🤖 Создать бота с этим токеном", callback_data=f"create_{text}")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.message.reply_text(
+                "🔑 **Обнаружен токен бота!**\n\n"
+                "Хотите создать бота с этим токеном?",
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+        else:
+            # Показываем помощь
+            await update.message.reply_text(
+                "💡 **Используйте команды:**\n\n"
+                "/start - Начало работы\n"
+                "/create [токен] - Создать бота\n"
+                "/mybots - Мои боты\n"
+                "/stop [номер] - Остановить бота\n\n"
+                "🔗 **Как получить токен:**\n"
+                "1. Откройте @BotFather\n"
+                "2. Создайте нового бота\n"
+                "3. Скопируйте токен\n"
+                "4. Используйте /create с токеном",
+                parse_mode='Markdown'
+            )
+    
+    def load_existing_bots(self):
+        """Загрузка существующих ботов при запуске"""
+        all_bots = self.mirror_db.get_all_bots()
+        
+        for owner_id, bot_token, bot_username, status, created_at in all_bots:
+            if status == 'active':
+                try:
+                    user_bot = UserBot(bot_token, owner_id)
+                    if user_bot.initialize():
+                        thread = threading.Thread(target=user_bot.run, daemon=True)
+                        thread.start()
+                        ACTIVE_USER_BOTS[bot_token] = user_bot
+                        logger.info(f"Загружен бот: @{bot_username}")
+                except Exception as e:
+                    logger.error(f"Ошибка загрузки бота {bot_token[:10]}...: {e}")
+    
     def run(self):
         """Запуск основного бота"""
         # Загружаем существующих ботов
         self.load_existing_bots()
         
-        print("🤖 Основной бот-зеркало запущен!")
-        print("💡 Используйте /start в Telegram для начала работы")
+        print("=" * 50)
+        print("🤖 MIRROR BOT CREATOR")
+        print("=" * 50)
+        print(f"✅ Загружено ботов: {len(ACTIVE_USER_BOTS)}")
+        print("💡 Бот запущен и готов к работе!")
+        print("🔗 Используйте /start в Telegram для начала работы")
+        print("=" * 50)
+        
         self.application.run_polling()
 
-# Запуск основного бота-зеркала
+# ==================== ЗАПУСК ПРОГРАММЫ ====================
+
 if __name__ == "__main__":
-    # Токен основного бота (замените на свой)
+    # Токен основного бота-зеркала
+    # ЗАМЕНИТЕ ЭТОТ ТОКЕН НА ВАШ ТОКЕН ОТ @BotFather
     MAIN_BOT_TOKEN = "8517379434:AAGqMYBuEQZ8EMNRf3g4yBN-Q0jpm5u5eZU"
     
-    if MAIN_BOT_TOKEN == "YOUR_MAIN_BOT_TOKEN_HERE":
-        print("❌ Пожалуйста, установите ваш токен бота в переменную MAIN_BOT_TOKEN")
-        print("💡 Получите токен у @BotFather")
-    else:
-        mirror_bot = MirrorBot(MAIN_BOT_TOKEN)
-        mirror_bot.run()
+    # Создаем и запускаем основной бот
+    mirror_bot = MirrorBot(MAIN_BOT_TOKEN)
+    mirror_bot.run()
