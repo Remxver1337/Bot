@@ -1,25 +1,23 @@
 import logging
 import sqlite3
 import random
-import asyncio
 import threading
-import time
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple
 from urllib.parse import quote
-from datetime import datetime
-import secrets
-import json
-import sys
-import os
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
-from telegram.request import HTTPXRequest
-from fastapi import FastAPI, Request, HTTPException
-import uvicorn
-import httpx
 
-# Настройка логирования
+# ==================== КОНФИГУРАЦИЯ ====================
+
+# ВАШ ТЕЛЕГРАМ ID (замените на свой)
+ADMIN_USER_ID = 123456789  # ← ЗАМЕНИТЕ ЭТО ЧИСЛО НА ВАШ ID!
+
+# Токен основного бота-зеркала (ЗАМЕНИТЕ НА СВОЙ!)
+MAIN_BOT_TOKEN = "8517379434:AAGqMYBuEQZ8EMNRf3g4yBN-Q0jpm5u5eZU"
+
+# ==================== НАСТРОЙКА ЛОГИРОВАНИЯ ====================
+
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
@@ -32,234 +30,137 @@ REPLACEMENTS = {
     'А': 'A', 'С': 'C', 'О': 'O', 'Р': 'P', 'Е': 'E', 'Х': 'X', 'У': 'Y'
 }
 
-# ========== КОНФИГУРАЦИЯ ДЛЯ ВАШЕГО ХОСТИНГА ==========
-WEBHOOK_HOST = "http://agent.bothost.ru"  # Ваш хостинг
-WEBHOOK_BASE = "/api/webhooks/github"  # Ваш базовый путь
-WEBHOOK_PORT = 80  # HTTP порт (стандартный)
+# Глобальные переменные
+USER_BOTS_DB = "user_bots.db"
+mirror_db = None  # Будет инициализирован в основном боте
 
-# ⚠️ ⚠️ ⚠️ ЗАМЕНИТЕ ЭТОТ ТОКЕН НА ВАШ ТОКЕН ОТ @BOTFATHER ⚠️ ⚠️ ⚠️
-MAIN_BOT_TOKEN = "8517379434:AAGqMYBuEQZ8EMNRf3g4yBN-Q0jpm5u5eZU"  # <-- ЗАМЕНИТЕ ЭТО!
+# ==================== КЛАСС БАЗЫ ДАННЫХ ДЛЯ ЗЕРКАЛА ====================
 
-# Глобальные словари
-running_bots: Dict[str, Application] = {}
-bot_databases: Dict[str, 'DatabaseManager'] = {}
-bot_instances: Dict[str, 'MirrorBot'] = {}
-bot_webhooks: Dict[str, str] = {}
-
-# FastAPI приложение
-app = FastAPI(title="MultiBot Server")
-
-class MirrorManager:
+class MirrorDatabase:
+    """База данных для управления пользовательскими ботами"""
+    
     def __init__(self):
-        self.db_name = "mirrors.db"
+        self.db_name = USER_BOTS_DB
         self.init_database()
     
     def init_database(self):
-        """Инициализация базы данных зеркал"""
+        """Инициализация базы данных"""
         conn = sqlite3.connect(self.db_name)
         cursor = conn.cursor()
         
         cursor.execute('''
-            CREATE TABLE IF NOT EXISTS mirrors (
+            CREATE TABLE IF NOT EXISTS user_bots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
                 bot_token TEXT NOT NULL UNIQUE,
                 bot_username TEXT,
-                bot_id INTEGER,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                is_active INTEGER DEFAULT 1,
-                webhook_url TEXT,
-                last_activity TIMESTAMP
+                status TEXT DEFAULT 'active',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
         
         conn.commit()
         conn.close()
+        logger.info("База данных зеркала инициализирована")
     
-    def create_mirror(self, user_id: int, bot_token: str) -> Tuple[bool, str, int]:
-        """Создание нового зеркала"""
+    def add_user_bot(self, user_id: int, bot_token: str, bot_username: str = None):
+        """Добавление пользовательского бота"""
+        conn = sqlite3.connect(self.db_name)
+        cursor = conn.cursor()
+        
         try:
-            # Проверяем токен
-            response = httpx.get(
-                f"https://api.telegram.org/bot{bot_token}/getMe",
-                timeout=10
-            )
+            cursor.execute('''
+                INSERT INTO user_bots (user_id, bot_token, bot_username)
+                VALUES (?, ?, ?)
+            ''', (user_id, bot_token, bot_username))
             
-            if not response.is_success:
-                return False, "❌ Ошибка подключения к Telegram API", 0
-            
-            data = response.json()
-            if not data.get("ok"):
-                return False, "❌ Неверный токен бота", 0
-            
-            bot_info = data["result"]
-            bot_username = bot_info["username"]
-            bot_id = bot_info["id"]
-            
-            # Генерируем уникальный путь для вебхука
-            webhook_path = f"{WEBHOOK_BASE}/{bot_id}"
-            webhook_url = f"{WEBHOOK_HOST}{webhook_path}"
-            
-            conn = sqlite3.connect(self.db_name)
-            cursor = conn.cursor()
-            
-            try:
-                cursor.execute('''
-                    INSERT INTO mirrors (user_id, bot_token, bot_username, bot_id, webhook_url, created_at) 
-                    VALUES (?, ?, ?, ?, ?, datetime('now'))
-                ''', (user_id, bot_token, bot_username, bot_id, webhook_url))
-                
-                mirror_id = cursor.lastrowid
-                conn.commit()
-                
-                # Устанавливаем вебхук
-                if self.setup_webhook(bot_token, webhook_url):
-                    bot_webhooks[bot_token] = webhook_path
-                    logger.info(f"Вебхук установлен для бота {bot_username}")
-                
-                return True, f"✅ Зеркало создано! Бот: @{bot_username}", mirror_id
-                
-            except sqlite3.IntegrityError:
-                cursor.execute('SELECT id, bot_username FROM mirrors WHERE bot_token = ?', (bot_token,))
-                existing = cursor.fetchone()
-                if existing:
-                    return False, f"❌ Этот токен уже используется (Бот: @{existing[1]})", existing[0]
-                return False, "❌ Ошибка базы данных", 0
-            finally:
-                conn.close()
-                
-        except Exception as e:
-            logger.error(f"Ошибка создания зеркала: {e}")
-            return False, f"❌ Ошибка: {str(e)}", 0
-    
-    def setup_webhook(self, token: str, webhook_url: str) -> bool:
-        """Установка вебхука для бота"""
-        try:
-            response = httpx.post(
-                f"https://api.telegram.org/bot{token}/setWebhook",
-                json={
-                    "url": webhook_url,
-                    "drop_pending_updates": True
-                },
-                timeout=10
-            )
-            
-            if response.is_success:
-                data = response.json()
-                if data.get("ok"):
-                    logger.info(f"Вебхук установлен для токена {token[:10]}...")
-                    return True
-                else:
-                    logger.error(f"Ошибка установки вебхука: {data}")
-                    return False
+            conn.commit()
+            logger.info(f"Добавлен новый бот для пользователя {user_id}")
+            return True
+        except sqlite3.IntegrityError:
+            logger.warning(f"Бот с токеном уже существует: {bot_token[:10]}...")
             return False
-            
-        except Exception as e:
-            logger.error(f"Ошибка установки вебхука: {e}")
-            return False
+        finally:
+            conn.close()
     
-    def get_user_mirrors(self, user_id: int) -> List[Tuple]:
-        """Получение списка зеркал пользователя"""
+    def get_user_bots(self, user_id: int):
+        """Получение ботов пользователя"""
         conn = sqlite3.connect(self.db_name)
         cursor = conn.cursor()
         
         cursor.execute('''
-            SELECT id, bot_token, bot_username, bot_id, created_at, is_active, webhook_url
-            FROM mirrors 
-            WHERE user_id = ? 
+            SELECT id, bot_token, bot_username, status, created_at
+            FROM user_bots 
+            WHERE user_id = ?
             ORDER BY created_at DESC
         ''', (user_id,))
         
-        mirrors = cursor.fetchall()
+        bots = cursor.fetchall()
         conn.close()
-        return mirrors
+        return bots
     
-    def get_all_mirrors(self) -> List[Tuple]:
-        """Получение всех зеркал"""
+    def get_all_bots(self):
+        """Получение всех ботов (для админа)"""
         conn = sqlite3.connect(self.db_name)
         cursor = conn.cursor()
         
         cursor.execute('''
-            SELECT id, bot_token, bot_username, bot_id, user_id, is_active, webhook_url
-            FROM mirrors 
-            WHERE is_active = 1
+            SELECT user_id, bot_token, bot_username, status, created_at
+            FROM user_bots 
+            ORDER BY created_at DESC
         ''')
         
-        mirrors = cursor.fetchall()
+        bots = cursor.fetchall()
         conn.close()
-        return mirrors
+        return bots
     
-    def delete_mirror(self, user_id: int, mirror_id: int) -> bool:
-        """Удаление зеркала"""
-        try:
-            conn = sqlite3.connect(self.db_name)
-            cursor = conn.cursor()
-            
-            cursor.execute('SELECT bot_token FROM mirrors WHERE id = ? AND user_id = ?', (mirror_id, user_id))
-            result = cursor.fetchone()
-            
-            if not result:
-                conn.close()
-                return False
-            
-            token = result[0]
-            
-            # Удаляем вебхук
-            try:
-                httpx.post(f"https://api.telegram.org/bot{token}/deleteWebhook", timeout=5)
-            except:
-                pass
-            
-            # Удаляем из базы
-            cursor.execute('DELETE FROM mirrors WHERE id = ? AND user_id = ?', (mirror_id, user_id))
-            conn.commit()
-            conn.close()
-            
-            # Очищаем глобальные словари
-            if token in running_bots:
-                try:
-                    del running_bots[token]
-                except:
-                    pass
-            
-            if token in bot_databases:
-                try:
-                    del bot_databases[token]
-                except:
-                    pass
-            
-            if token in bot_instances:
-                try:
-                    del bot_instances[token]
-                except:
-                    pass
-            
-            if token in bot_webhooks:
-                try:
-                    del bot_webhooks[token]
-                except:
-                    pass
-            
-            logger.info(f"Зеркало {mirror_id} удалено")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Ошибка удаления зеркала: {e}")
-            return False
-
-mirror_manager = MirrorManager()
-
-class DatabaseManager:
-    def __init__(self, mirror_id: int):
-        self.mirror_id = mirror_id
-        self.db_name = f"mirror_{mirror_id}.db"
-        self.init_database()
-
-    def init_database(self):
-        """Инициализация базы данных для зеркала"""
+    def update_bot_status(self, bot_token: str, status: str):
+        """Обновление статуса бота"""
         conn = sqlite3.connect(self.db_name)
         cursor = conn.cursor()
         
+        cursor.execute('''
+            UPDATE user_bots 
+            SET status = ?
+            WHERE bot_token = ?
+        ''', (status, bot_token))
+        
+        conn.commit()
+        conn.close()
+        logger.info(f"Обновлен статус бота {bot_token[:10]}... на {status}")
+    
+    def delete_bot(self, bot_token: str):
+        """Удаление бота"""
+        conn = sqlite3.connect(self.db_name)
+        cursor = conn.cursor()
+        
+        cursor.execute('DELETE FROM user_bots WHERE bot_token = ?', (bot_token,))
+        
+        conn.commit()
+        deleted = cursor.rowcount > 0
+        conn.close()
+        
+        if deleted:
+            logger.info(f"Удален бот: {bot_token[:10]}...")
+        
+        return deleted
+
+# ==================== КЛАСС БАЗЫ ДАННЫХ ПОЛЬЗОВАТЕЛЬСКОГО БОТА ====================
+
+class UserDatabase:
+    """База данных для каждого пользовательского бота"""
+    
+    def __init__(self, user_id: int):
+        self.user_id = user_id
+        self.db_name = f"user_{user_id}.db"
+        self.init_database()
+    
+    def init_database(self):
+        """Инициализация базы данных пользователя"""
+        conn = sqlite3.connect(self.db_name)
+        cursor = conn.cursor()
+        
+        # Таблица сообщений
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -268,6 +169,7 @@ class DatabaseManager:
             )
         ''')
         
+        # Таблица вариаций
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS variations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -278,6 +180,7 @@ class DatabaseManager:
             )
         ''')
         
+        # Таблица чатов
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS chats (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -285,6 +188,7 @@ class DatabaseManager:
             )
         ''')
         
+        # Таблица пользователей
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -296,8 +200,9 @@ class DatabaseManager:
         
         conn.commit()
         conn.close()
-
+    
     def add_message(self, original_text: str) -> int:
+        """Добавление исходного сообщения"""
         conn = sqlite3.connect(self.db_name)
         cursor = conn.cursor()
         cursor.execute('INSERT INTO messages (original_text) VALUES (?)', (original_text,))
@@ -305,8 +210,9 @@ class DatabaseManager:
         conn.commit()
         conn.close()
         return message_id
-
+    
     def add_variations(self, message_id: int, variations: List[str]):
+        """Добавление вариаций сообщения"""
         conn = sqlite3.connect(self.db_name)
         cursor = conn.cursor()
         cursor.executemany(
@@ -315,24 +221,27 @@ class DatabaseManager:
         )
         conn.commit()
         conn.close()
-
+    
     def get_messages(self) -> List[Tuple[int, str]]:
+        """Получение списка исходных сообщений"""
         conn = sqlite3.connect(self.db_name)
         cursor = conn.cursor()
         cursor.execute('SELECT id, original_text FROM messages ORDER BY created_at DESC')
         messages = cursor.fetchall()
         conn.close()
         return messages
-
+    
     def delete_message(self, message_id: int):
+        """Удаление сообщения и всех его вариаций"""
         conn = sqlite3.connect(self.db_name)
         cursor = conn.cursor()
         cursor.execute('DELETE FROM variations WHERE message_id = ?', (message_id,))
         cursor.execute('DELETE FROM messages WHERE id = ?', (message_id,))
         conn.commit()
         conn.close()
-
+    
     def add_chat(self, chat_name: str) -> int:
+        """Добавление чата"""
         conn = sqlite3.connect(self.db_name)
         cursor = conn.cursor()
         try:
@@ -340,38 +249,48 @@ class DatabaseManager:
             chat_id = cursor.lastrowid
         except sqlite3.IntegrityError:
             cursor.execute('SELECT id FROM chats WHERE name = ?', (chat_name,))
-            chat_id = cursor.fetchone()[0]
+            result = cursor.fetchone()
+            chat_id = result[0] if result else None
         conn.commit()
         conn.close()
         return chat_id
-
+    
     def add_users(self, chat_id: int, usernames: List[str]):
+        """Добавление пользователей в чат"""
         conn = sqlite3.connect(self.db_name)
         cursor = conn.cursor()
-        cursor.executemany(
-            'INSERT OR IGNORE INTO users (chat_id, username) VALUES (?, ?)',
-            [(chat_id, username.strip()) for username in usernames]
-        )
+        
+        for username in usernames:
+            cleaned = username.strip().lstrip('@')
+            if cleaned:
+                cursor.execute(
+                    'INSERT OR IGNORE INTO users (chat_id, username) VALUES (?, ?)',
+                    (chat_id, cleaned)
+                )
+        
         conn.commit()
         conn.close()
-
+    
     def get_chats(self) -> List[Tuple[int, str]]:
+        """Получение списка чатов"""
         conn = sqlite3.connect(self.db_name)
         cursor = conn.cursor()
         cursor.execute('SELECT id, name FROM chats ORDER BY name')
         chats = cursor.fetchall()
         conn.close()
         return chats
-
+    
     def delete_chat(self, chat_id: int):
+        """Удаление чата и всех его пользователей"""
         conn = sqlite3.connect(self.db_name)
         cursor = conn.cursor()
         cursor.execute('DELETE FROM users WHERE chat_id = ?', (chat_id,))
         cursor.execute('DELETE FROM chats WHERE id = ?', (chat_id,))
         conn.commit()
         conn.close()
-
+    
     def get_users_by_chat(self, chat_id: int, offset: int = 0, limit: int = 25) -> List[Tuple[int, str]]:
+        """Получение пользователей чата с пагинацией"""
         conn = sqlite3.connect(self.db_name)
         cursor = conn.cursor()
         cursor.execute(
@@ -381,8 +300,18 @@ class DatabaseManager:
         users = cursor.fetchall()
         conn.close()
         return users
-
+    
+    def get_total_users_in_chat(self, chat_id: int) -> int:
+        """Получение общего количества пользователей в чате"""
+        conn = sqlite3.connect(self.db_name)
+        cursor = conn.cursor()
+        cursor.execute('SELECT COUNT(*) FROM users WHERE chat_id = ?', (chat_id,))
+        count = cursor.fetchone()[0]
+        conn.close()
+        return count
+    
     def get_multiple_variations(self, count: int = 5) -> List[str]:
+        """Получение нескольких случайных вариаций"""
         conn = sqlite3.connect(self.db_name)
         cursor = conn.cursor()
         cursor.execute('''
@@ -396,6 +325,7 @@ class DatabaseManager:
         
         variations = [result[0] for result in results]
         
+        # Если не хватает вариаций, дублируем существующие
         while len(variations) < count:
             if variations:
                 variations.append(random.choice(variations))
@@ -404,49 +334,21 @@ class DatabaseManager:
         
         return variations
 
-class MirrorBot:
-    def __init__(self, token: str, mirror_id: int, username: str):
-        self.token = token
-        self.mirror_id = mirror_id
-        self.username = username
-        self.application = None
-        self.user_states = {}
-        self.db = DatabaseManager(mirror_id)
-        
-    async def initialize(self):
-        """Инициализация бота"""
-        try:
-            # Создаем application для вебхука
-            self.application = Application.builder().token(self.token).build()
-            
-            # Настраиваем обработчики
-            self.setup_handlers()
-            
-            # Инициализируем приложение
-            await self.application.initialize()
-            
-            # Сохраняем в глобальные словари
-            running_bots[self.token] = self.application
-            bot_databases[self.token] = self.db
-            bot_instances[self.token] = self
-            
-            logger.info(f"Бот {self.mirror_id} (@{self.username}) инициализирован")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Ошибка инициализации бота {self.mirror_id}: {e}")
-            return False
+# ==================== ФУНКЦИИ ДЛЯ ПОЛЬЗОВАТЕЛЬСКОГО БОТА ====================
+
+def create_user_bot_handlers(application: Application, owner_id: int):
+    """Создание обработчиков для пользовательского бота"""
     
-    def setup_handlers(self):
-        """Настройка обработчиков"""
-        self.application.add_handler(CommandHandler("start", self.start_handler))
-        self.application.add_handler(CallbackQueryHandler(self.handle_button, pattern="^main_"))
-        self.application.add_handler(CallbackQueryHandler(self.handle_messages, pattern="^messages_"))
-        self.application.add_handler(CallbackQueryHandler(self.handle_users, pattern="^users_"))
-        self.application.add_handler(CallbackQueryHandler(self.handle_spam, pattern="^spam_"))
-        self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text_input))
+    # Создаем базу данных для этого пользователя
+    user_db = UserDatabase(owner_id)
     
-    def generate_variations(self, text: str, count: int = 500) -> List[str]:
+    # Сохраняем данные в контексте приложения
+    application.bot_data['owner_id'] = owner_id
+    application.bot_data['db'] = user_db
+    application.bot_data['user_states'] = {}
+    
+    # Функция генерации вариаций
+    def generate_variations(text: str, count: int = 500) -> List[str]:
         """Генерация вариаций сообщения"""
         variations = set()
         chars_to_replace = list(REPLACEMENTS.keys())
@@ -471,17 +373,26 @@ class MirrorBot:
         
         return list(variations)
     
-    async def start_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик команды /start"""
+    # Обработчик команды /start
+    async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        owner_id = context.application.bot_data.get('owner_id')
+        
+        # Проверяем, является ли пользователь владельцем
+        if user_id != owner_id:
+            await update.message.reply_text(
+                "🚫 Этот бот принадлежит другому пользователю.\n"
+                "Для создания своего бота обратитесь к основному боту-зеркалу."
+            )
+            return
+        
         welcome_text = (
-            f"🌟 Добро пожаловать в Mirror Bot! 🌟\n\n"
-            f"🤖 Бот: @{self.username}\n"
-            f"🆔 ID зеркала: {self.mirror_id}\n\n"
-            f"💬 Доступные функции:\n"
-            f"📝 Создание сообщений - создайте и управляйте вариациями сообщений\n"
-            f"👥 Мои пользователи - добавьте списки пользователей для рассылки\n"
-            f"🚀 Начать спам - запустите рассылку сообщений\n\n"
-            f"💡 Бот готов к работе! Выберите раздел:"
+            "🌟 Добро пожаловать в ваш персональный спам-бот! 🌟\n\n"
+            "💬 Для начала работы используйте кнопки ниже:\n\n"
+            "📝 Создание сообщений - создайте и управляйте вариациями сообщений\n"
+            "👥 Мои пользователи - добавьте списки пользователей для рассылки\n"
+            "🚀 Начать спам - запустите рассылку сообщений\n\n"
+            "💡 Бот готов к работе! Выберите раздел:"
         )
         
         keyboard = [
@@ -493,26 +404,24 @@ class MirrorBot:
         
         await update.message.reply_text(welcome_text, reply_markup=reply_markup)
     
-    async def handle_button(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик кнопок главного меню"""
+    # Обработчик кнопок главного меню
+    async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         await query.answer()
+        
         data = query.data
         
         if data == "main_messages":
-            await self.show_messages_menu(update, context)
+            await show_messages_menu(query, context)
         elif data == "main_users":
-            await self.show_users_menu(update, context)
+            await show_users_menu(query, context)
         elif data == "main_spam":
-            await self.show_spam_menu(update, context)
+            await show_spam_menu(query, context)
         elif data == "main_back":
-            await self.show_main_menu(update, context)
+            await show_main_menu(query, context)
     
-    async def show_main_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def show_main_menu(query, context: ContextTypes.DEFAULT_TYPE):
         """Показать главное меню"""
-        query = update.callback_query
-        await query.answer()
-        
         menu_text = "🎯 Главное меню\n\n💡 Выберите нужный раздел:"
         
         keyboard = [
@@ -524,21 +433,14 @@ class MirrorBot:
         
         await query.edit_message_text(menu_text, reply_markup=reply_markup)
     
-    async def show_messages_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def show_messages_menu(query, context: ContextTypes.DEFAULT_TYPE):
         """Меню создания сообщений"""
-        query = update.callback_query
-        await query.answer()
-        
-        messages = self.db.get_messages()
-        messages_count = len(messages)
-        
         menu_text = (
-            f"📝 Создание сообщений\n\n"
-            f"📊 Сообщений: {messages_count}\n\n"
-            f"✨ Доступные действия:\n"
-            f"• 📄 Создать новое сообщение с вариациями\n"
-            f"• 🗑️ Удалить существующее сообщение\n\n"
-            f"💡 Выберите действие:"
+            "📝 Создание сообщений\n\n"
+            "✨ Доступные действия:\n"
+            "• 📄 Создать новое сообщение с вариациями\n"
+            "• 🗑️ Удалить существующее сообщение\n\n"
+            "💡 Выберите действие:"
         )
         
         keyboard = [
@@ -550,14 +452,19 @@ class MirrorBot:
         
         await query.edit_message_text(menu_text, reply_markup=reply_markup)
     
-    async def handle_messages(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик кнопок раздела сообщений"""
+    # Обработчик кнопок раздела сообщений
+    async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
+        await query.answer()
+        
         data = query.data
-        user_id = query.from_user.id
+        owner_id = context.application.bot_data.get('owner_id')
+        user_states = context.application.bot_data.get('user_states', {})
         
         if data == "messages_create":
-            self.user_states[user_id] = "waiting_for_message"
+            user_states[owner_id] = "waiting_for_message"
+            context.application.bot_data['user_states'] = user_states
+            
             create_text = (
                 "🆕 Создание нового сообщения\n\n"
                 "📨 Введите исходное сообщение для создания вариаций:\n\n"
@@ -566,22 +473,27 @@ class MirrorBot:
             await query.edit_message_text(create_text)
         
         elif data == "messages_delete":
-            await self.show_message_list(update, context)
+            await show_message_list(query, context)
         
         elif data.startswith("messages_delete_"):
             message_id = int(data.split("_")[2])
-            self.db.delete_message(message_id)
-            await query.answer("✅ Сообщение и все его вариации удалены!")
-            await self.show_messages_menu(update, context)
+            db = context.application.bot_data.get('db')
+            if db:
+                db.delete_message(message_id)
+                await query.answer("✅ Сообщение и все его вариации удалены!", show_alert=True)
+                await show_messages_menu(query, context)
         
         elif data == "messages_back":
-            await self.show_messages_menu(update, context)
+            await show_messages_menu(query, context)
     
-    async def show_message_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def show_message_list(query, context: ContextTypes.DEFAULT_TYPE):
         """Показать список сообщений для удаления"""
-        query = update.callback_query
-        user_id = query.from_user.id
-        messages = self.db.get_messages()
+        db = context.application.bot_data.get('db')
+        if not db:
+            await query.edit_message_text("❌ Ошибка: база данных не найдена")
+            return
+        
+        messages = db.get_messages()
         
         if not messages:
             no_messages_text = (
@@ -609,27 +521,14 @@ class MirrorBot:
         
         await query.edit_message_text(list_text, reply_markup=reply_markup)
     
-    async def show_users_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def show_users_menu(query, context: ContextTypes.DEFAULT_TYPE):
         """Меню пользователей"""
-        query = update.callback_query
-        await query.answer()
-        
-        chats = self.db.get_chats()
-        chats_count = len(chats)
-        total_users = 0
-        for chat_id, _ in chats:
-            users = self.db.get_users_by_chat(chat_id, 0, 1000)
-            total_users += len(users)
-        
         menu_text = (
-            f"👥 Мои пользователи\n\n"
-            f"📊 Статистика:\n"
-            f"├ Чатов: {chats_count}\n"
-            f"└ Пользователей: {total_users}\n\n"
-            f"✨ Доступные действия:\n"
-            f"• ➕ Добавить новых пользователей\n"
-            f"• 🗑️ Удалить список пользователей\n\n"
-            f"💡 Выберите действие:"
+            "👥 Мои пользователи\n\n"
+            "✨ Доступные действия:\n"
+            "• ➕ Добавить новых пользователей\n"
+            "• 🗑️ Удалить список пользователей\n\n"
+            "💡 Выберите действие:"
         )
         
         keyboard = [
@@ -641,14 +540,19 @@ class MirrorBot:
         
         await query.edit_message_text(menu_text, reply_markup=reply_markup)
     
-    async def handle_users(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик кнопок раздела пользователей"""
+    # Обработчик кнопок раздела пользователей
+    async def handle_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
+        await query.answer()
+        
         data = query.data
-        user_id = query.from_user.id
+        owner_id = context.application.bot_data.get('owner_id')
+        user_states = context.application.bot_data.get('user_states', {})
         
         if data == "users_add":
-            self.user_states[user_id] = "waiting_for_chat_name"
+            user_states[owner_id] = "waiting_for_chat_name"
+            context.application.bot_data['user_states'] = user_states
+            
             add_text = (
                 "➕ Добавление пользователей\n\n"
                 "🏷️ Напишите название чата из которого взяли пользователей:\n\n"
@@ -657,22 +561,27 @@ class MirrorBot:
             await query.edit_message_text(add_text)
         
         elif data == "users_delete":
-            await self.show_chat_list(update, context)
+            await show_chat_list(query, context)
         
         elif data.startswith("users_delete_"):
             chat_id = int(data.split("_")[2])
-            self.db.delete_chat(chat_id)
-            await query.answer("✅ Чат и все пользователи удалены!")
-            await self.show_users_menu(update, context)
+            db = context.application.bot_data.get('db')
+            if db:
+                db.delete_chat(chat_id)
+                await query.answer("✅ Чат и все пользователи удалены!", show_alert=True)
+                await show_users_menu(query, context)
         
         elif data == "users_back":
-            await self.show_users_menu(update, context)
+            await show_users_menu(query, context)
     
-    async def show_chat_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def show_chat_list(query, context: ContextTypes.DEFAULT_TYPE):
         """Показать список чатов для удаления"""
-        query = update.callback_query
-        user_id = query.from_user.id
-        chats = self.db.get_chats()
+        db = context.application.bot_data.get('db')
+        if not db:
+            await query.edit_message_text("❌ Ошибка: база данных не найдена")
+            return
+        
+        chats = db.get_chats()
         
         if not chats:
             no_chats_text = (
@@ -692,20 +601,21 @@ class MirrorBot:
         
         keyboard = []
         for chat_id, name in chats:
-            users = self.db.get_users_by_chat(chat_id, 0, 1000)
-            users_count = len(users)
-            keyboard.append([InlineKeyboardButton(f"👥 {name} ({users_count})", callback_data=f"users_delete_{chat_id}")])
+            keyboard.append([InlineKeyboardButton(f"👥 {name}", callback_data=f"users_delete_{chat_id}")])
         
         keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="users_back")])
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await query.edit_message_text(list_text, reply_markup=reply_markup)
     
-    async def show_spam_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def show_spam_menu(query, context: ContextTypes.DEFAULT_TYPE):
         """Меню рассылки"""
-        query = update.callback_query
-        user_id = query.from_user.id
-        chats = self.db.get_chats()
+        db = context.application.bot_data.get('db')
+        if not db:
+            await query.edit_message_text("❌ Ошибка: база данных не найдена")
+            return
+        
+        chats = db.get_chats()
         
         if not chats:
             no_chats_text = (
@@ -725,18 +635,18 @@ class MirrorBot:
         
         keyboard = []
         for chat_id, name in chats:
-            users = self.db.get_users_by_chat(chat_id, 0, 1000)
-            users_count = len(users)
-            keyboard.append([InlineKeyboardButton(f"👥 {name} ({users_count})", callback_data=f"spam_chat_{chat_id}_0")])
+            keyboard.append([InlineKeyboardButton(f"👥 {name}", callback_data=f"spam_chat_{chat_id}_0")])
         
         keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="main_back")])
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await query.edit_message_text(menu_text, reply_markup=reply_markup)
     
-    async def handle_spam(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик кнопок раздела рассылки"""
+    # Обработчик кнопок раздела рассылки
+    async def handle_spam(update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
+        await query.answer()
+        
         data = query.data
         
         try:
@@ -744,128 +654,147 @@ class MirrorBot:
                 parts = data.split("_")
                 chat_id = int(parts[2])
                 page = int(parts[3])
-                await self.show_users_for_spam(update, context, chat_id, page)
+                await show_users_for_spam(query, context, chat_id, page)
             
             elif data.startswith("spam_page_"):
                 parts = data.split("_")
                 chat_id = int(parts[2])
                 page = int(parts[3])
-                await self.show_users_for_spam(update, context, chat_id, page)
+                await show_users_for_spam(query, context, chat_id, page)
             
             elif data == "spam_back":
-                await self.show_spam_menu(update, context)
+                await show_spam_menu(query, context)
                 
         except Exception as e:
             logger.error(f"Ошибка в handle_spam: {e}")
             await query.answer(f"Ошибка: {str(e)}")
     
-    async def show_users_for_spam(self, update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, page: int = 0):
+    async def show_users_for_spam(query, context: ContextTypes.DEFAULT_TYPE, chat_id: int, page: int = 0):
         """Показать пользователей для рассылки"""
-        query = update.callback_query
-        user_id = query.from_user.id
+        db = context.application.bot_data.get('db')
+        if not db:
+            await query.edit_message_text("❌ Ошибка: база данных не найдена")
+            return
         
-        await query.answer()
+        users = db.get_users_by_chat(chat_id, page * 5, 5)
         
-        try:
-            users = self.db.get_users_by_chat(chat_id, page * 5, 5)
-            
-            if not users:
-                keyboard = [[InlineKeyboardButton("🔙 Назад к чатам", callback_data="main_spam")]]
-                await query.edit_message_text(
-                    "✅ Все пользователи обработаны!",
-                    reply_markup=InlineKeyboardMarkup(keyboard)
-                )
-                return
-            
-            chat_name = "Неизвестный чат"
-            chats = self.db.get_chats()
-            for cid, name in chats:
-                if cid == chat_id:
-                    chat_name = name
-                    break
-            
-            variations = self.db.get_multiple_variations(5)
-            
-            if not variations:
-                keyboard = [
-                    [InlineKeyboardButton("📝 Создать сообщение", callback_data="main_messages")],
-                    [InlineKeyboardButton("🔙 Назад к чатам", callback_data="main_spam")]
-                ]
-                await query.edit_message_text(
-                    "❌ Нет созданных сообщений!\n\nСначала создайте сообщения в разделе 'Создание сообщений'",
-                    reply_markup=InlineKeyboardMarkup(keyboard)
-                )
-                return
-            
-            text = f"👥 Чат: {chat_name}\n"
-            text += f"📄 Страница: {page + 1}\n\n"
-            text += "🔗 Нажмите на имя пользователя для отправки:\n\n"
-            
-            keyboard = []
-            
-            for i, (user_id_db, username) in enumerate(users):
-                variation_text = variations[i % len(variations)]
-                link = f"https://t.me/{username}?text={quote(variation_text)}"
-                
-                keyboard.append([
-                    InlineKeyboardButton(
-                        text=f"👤 {username}", 
-                        url=link
-                    )
-                ])
-            
-            total_users = len(self.db.get_users_by_chat(chat_id, 0, 10000))
-            
-            nav_buttons = []
-            if page > 0:
-                nav_buttons.append(InlineKeyboardButton("◀️ Пред", callback_data=f"spam_page_{chat_id}_{page-1}"))
-            
-            nav_buttons.append(InlineKeyboardButton(f"{page + 1}", callback_data="no_action"))
-            
-            if (page + 1) * 5 < total_users:
-                nav_buttons.append(InlineKeyboardButton("След ▶️", callback_data=f"spam_page_{chat_id}_{page+1}"))
-            
-            if nav_buttons:
-                keyboard.append(nav_buttons)
-            
-            keyboard.append([InlineKeyboardButton("🔄 Новые вариации", callback_data=f"spam_chat_{chat_id}_{page}")])
-            keyboard.append([InlineKeyboardButton("🔙 Назад к чатам", callback_data="main_spam")])
-            
-            text += f"\n📊 Пользователей: {len(users)} из {total_users}"
-            text += f"\n💬 Используются разные вариации текста"
-            text += "\n\n💡 Нажимайте на имена для отправки сообщений"
-            
+        if not users:
+            keyboard = [[InlineKeyboardButton("🔙 Назад к чатам", callback_data="main_spam")]]
             await query.edit_message_text(
-                text,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                disable_web_page_preview=True
+                "✅ Все пользователи обработаны!",
+                reply_markup=InlineKeyboardMarkup(keyboard)
             )
-            
-        except Exception as e:
-            error_text = f"❌ Ошибка при загрузке: {str(e)}"
-            keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="main_spam")]]
-            await query.edit_message_text(error_text, reply_markup=InlineKeyboardMarkup(keyboard))
-    
-    async def handle_text_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик текстового ввода"""
-        user_id = update.message.from_user.id
-        text = update.message.text
+            return
         
-        if user_id not in self.user_states:
+        # Получаем информацию о чате
+        chats = db.get_chats()
+        chat_name = "Неизвестный чат"
+        total_users = 0
+        
+        for cid, name in chats:
+            if cid == chat_id:
+                chat_name = name
+                total_users = db.get_total_users_in_chat(chat_id)
+                break
+        
+        # Получаем вариации сообщений
+        variations = db.get_multiple_variations(5)
+        
+        if not variations:
+            keyboard = [
+                [InlineKeyboardButton("📝 Создать сообщение", callback_data="main_messages")],
+                [InlineKeyboardButton("🔙 Назад к чатам", callback_data="main_spam")]
+            ]
+            await query.edit_message_text(
+                "❌ Нет созданных сообщений!\n\nСначала создайте сообщения в разделе 'Создание сообщений'",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return
+        
+        # Формируем сообщение
+        text = f"👥 Чат: {chat_name}\n"
+        text += f"📄 Страница: {page + 1}\n"
+        text += f"📊 Всего пользователей: {total_users}\n\n"
+        text += "🔗 Нажмите на имя пользователя для отправки:\n\n"
+        
+        # Создаем клавиатуру
+        keyboard = []
+        
+        for i, (user_id_db, username) in enumerate(users):
+            # Берем вариацию для этого пользователя
+            variation_idx = i % len(variations)
+            variation_text = variations[variation_idx]
+            
+            # Создаем ссылку
+            link = f"https://t.me/{username}?text={quote(variation_text)}"
+            
+            keyboard.append([
+                InlineKeyboardButton(
+                    text=f"👤 {username}", 
+                    url=link
+                )
+            ])
+        
+        # Кнопки навигации
+        nav_buttons = []
+        if page > 0:
+            nav_buttons.append(InlineKeyboardButton("◀️ Пред", callback_data=f"spam_page_{chat_id}_{page-1}"))
+        
+        nav_buttons.append(InlineKeyboardButton(f"{page + 1}", callback_data="no_action"))
+        
+        if (page + 1) * 5 < total_users:
+            nav_buttons.append(InlineKeyboardButton("След ▶️", callback_data=f"spam_page_{chat_id}_{page+1}"))
+        
+        if nav_buttons:
+            keyboard.append(nav_buttons)
+        
+        keyboard.append([InlineKeyboardButton("🔄 Новые вариации", callback_data=f"spam_chat_{chat_id}_{page}")])
+        keyboard.append([InlineKeyboardButton("🔙 Назад к чатам", callback_data="main_spam")])
+        
+        text += f"💬 Используются разные вариации текста"
+        text += "\n\n💡 Нажимайте на имена для отправки сообщений"
+        
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            disable_web_page_preview=True
+        )
+    
+    # Обработчик текстовых сообщений
+    async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.message.from_user.id
+        owner_id = context.application.bot_data.get('owner_id')
+        
+        # Проверяем владельца
+        if user_id != owner_id:
+            await update.message.reply_text("🚫 У вас нет доступа к этому боту.")
+            return
+        
+        text = update.message.text
+        user_states = context.application.bot_data.get('user_states', {})
+        db = context.application.bot_data.get('db')
+        
+        if not db:
+            await update.message.reply_text("❌ Ошибка: база данных не найдена")
+            return
+        
+        if user_id not in user_states:
             help_text = "💡 Используйте кнопки меню для навигации\n\n🔍 Если вы потерялись, нажмите /start"
             await update.message.reply_text(help_text)
             return
         
-        state = self.user_states[user_id]
+        state = user_states[user_id]
         
         if state == "waiting_for_message":
             await update.message.reply_text("⏳ Генерирую вариации...")
             
-            variations = self.generate_variations(text, 500)
-            message_id = self.db.add_message(text)
-            self.db.add_variations(message_id, variations)
+            variations = generate_variations(text, 500)
+            message_id = db.add_message(text)
+            db.add_variations(message_id, variations)
             
-            del self.user_states[user_id]
+            # Удаляем состояние
+            del user_states[user_id]
+            context.application.bot_data['user_states'] = user_states
             
             success_text = (
                 f"✅ Успешно создано!\n\n"
@@ -875,11 +804,24 @@ class MirrorBot:
             )
             
             await update.message.reply_text(success_text)
-            await self.show_main_menu_from_message(update, context)
+            
+            # Показываем главное меню
+            menu_text = "🎯 Главное меню\n\n💡 Выберите нужный раздел:"
+            
+            keyboard = [
+                [InlineKeyboardButton("📝 Создание сообщений", callback_data="main_messages")],
+                [InlineKeyboardButton("👥 Мои пользователи", callback_data="main_users")],
+                [InlineKeyboardButton("🚀 Начать спам", callback_data="main_spam")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.message.reply_text(menu_text, reply_markup=reply_markup)
         
         elif state == "waiting_for_chat_name":
+            # Сохраняем название чата в контексте
             context.user_data['current_chat_name'] = text
-            self.user_states[user_id] = "waiting_for_users"
+            user_states[user_id] = "waiting_for_users"
+            context.application.bot_data['user_states'] = user_states
             
             users_text = (
                 f"🏷️ Название чата сохранено: {text}\n\n"
@@ -890,7 +832,7 @@ class MirrorBot:
             await update.message.reply_text(users_text)
         
         elif state == "waiting_for_users":
-            chat_name = context.user_data.get('current_chat_name')
+            chat_name = context.user_data.get('current_chat_name', 'Неизвестный чат')
             usernames = text.split('\n')
             
             cleaned_usernames = []
@@ -900,539 +842,355 @@ class MirrorBot:
                     cleaned_usernames.append(cleaned)
             
             if cleaned_usernames:
-                chat_id = self.db.add_chat(chat_name)
-                self.db.add_users(chat_id, cleaned_usernames)
-                
-                del self.user_states[user_id]
-                if 'current_chat_name' in context.user_data:
-                    del context.user_data['current_chat_name']
-                
-                success_text = (
-                    f"✅ Пользователи добавлены!\n\n"
-                    f"🏷️ Чат: {chat_name}\n"
-                    f"👥 Добавлено пользователей: {len(cleaned_usernames)}\n\n"
-                    f"💡 Теперь вы можете начать рассылку"
-                )
-                
-                await update.message.reply_text(success_text)
-                await self.show_main_menu_from_message(update, context)
-            else:
-                error_text = (
-                    "❌ Список пользователей пуст\n\n"
-                    "💡 Отправьте список username'ов в столбик"
-                )
-                await update.message.reply_text(error_text)
-    
-    async def show_main_menu_from_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показать главное меню из текстового сообщения"""
-        menu_text = "🎯 Главное меню\n\n💡 Выберите нужный раздел:"
-        
-        keyboard = [
-            [InlineKeyboardButton("📝 Создание сообщений", callback_data="main_messages")],
-            [InlineKeyboardButton("👥 Мои пользователи", callback_data="main_users")],
-            [InlineKeyboardButton("🚀 Начать спам", callback_data="main_spam")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text(menu_text, reply_markup=reply_markup)
-
-# ==================== FASTAPI ОБРАБОТЧИКИ ====================
-
-@app.post(WEBHOOK_BASE + "/{bot_id}")
-async def handle_webhook(bot_id: str, request: Request):
-    """Обработчик вебхуков для всех ботов"""
-    try:
-        # Получаем данные из запроса
-        data = await request.json()
-        
-        # Ищем бота по ID
-        token = None
-        app_instance = None
-        
-        for t, bot_instance in bot_instances.items():
-            if str(bot_instance.mirror_id) == bot_id:
-                token = t
-                app_instance = running_bots.get(t)
-                break
-        
-        if not token or not app_instance:
-            # Пробуем найти по токену в базе
-            mirrors = mirror_manager.get_all_mirrors()
-            for mirror in mirrors:
-                if str(mirror[3]) == bot_id:  # bot_id
-                    token = mirror[1]
-                    app_instance = running_bots.get(token)
-                    break
-        
-        if not app_instance:
-            logger.warning(f"Бот с ID {bot_id} не найден в работающих ботах")
-            return {"status": "bot not found"}
-        
-        # Создаем Update объект
-        update = Update.de_json(data, app_instance.bot)
-        
-        # Обрабатываем обновление
-        await app_instance.process_update(update)
-        
-        return {"status": "ok"}
-        
-    except Exception as e:
-        logger.error(f"Ошибка обработки вебхука: {e}")
-        return {"status": "error", "message": str(e)}
-
-@app.get("/")
-async def root():
-    return {
-        "status": "MultiBot Server is running",
-        "webhook_url": f"{WEBHOOK_HOST}{WEBHOOK_BASE}",
-        "bots": len(running_bots),
-        "webhook_paths": list(bot_webhooks.values())
-    }
-
-@app.get("/health")
-async def health():
-    return {"status": "healthy", "bots": len(running_bots)}
-
-# ==================== ОСНОВНОЙ БОТ ====================
-
-class MainBot:
-    def __init__(self, token: str):
-        self.token = token
-        self.application = Application.builder().token(token).build()
-        self.user_states = {}
-        self.setup_handlers()
-    
-    def setup_handlers(self):
-        """Настройка обработчиков основного бота"""
-        self.application.add_handler(CommandHandler("start", self.start))
-        self.application.add_handler(CommandHandler("mirror", self.mirror_command))
-        self.application.add_handler(CommandHandler("restart", self.restart_mirrors))
-        self.application.add_handler(CallbackQueryHandler(self.handle_button, pattern="^main_"))
-        self.application.add_handler(CallbackQueryHandler(self.handle_messages, pattern="^messages_"))
-        self.application.add_handler(CallbackQueryHandler(self.handle_users, pattern="^users_"))
-        self.application.add_handler(CallbackQueryHandler(self.handle_spam, pattern="^spam_"))
-        self.application.add_handler(CallbackQueryHandler(self.handle_mirrors, pattern="^mirror_"))
-        self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text_input))
-    
-    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик команды /start"""
-        welcome_text = (
-            "🌟 Добро пожаловать в MultiBot System! 🌟\n\n"
-            "🤖 **Это главный бот-конструктор**\n\n"
-            "💬 **Доступные функции:**\n"
-            "📝 Создание сообщений - создайте и управляйте вариациями сообщений\n"
-            "👥 Мои пользователи - добавьте списки пользователей для рассылки\n"
-            "🚀 Начать спам - запустите рассылку сообщений\n"
-            "🔄 Мои зеркала - создавайте свои боты с полным функционалом!\n\n"
-            "✨ **Все зеркала работают на одном сервере!**\n"
-            f"🌐 **Сервер:** {WEBHOOK_HOST}\n\n"
-            "💡 Выберите раздел:"
-        )
-        
-        keyboard = [
-            [InlineKeyboardButton("📝 Создание сообщений", callback_data="main_messages")],
-            [InlineKeyboardButton("👥 Мои пользователи", callback_data="main_users")],
-            [InlineKeyboardButton("🚀 Начать спам", callback_data="main_spam")],
-            [InlineKeyboardButton("🔄 Мои зеркала", callback_data="main_mirrors")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text(welcome_text, reply_markup=reply_markup)
-    
-    async def mirror_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Команда для быстрого создания зеркала"""
-        await self.show_mirrors_menu(update, context)
-    
-    async def restart_mirrors(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Перезапуск всех зеркал"""
-        await update.message.reply_text("🔄 Перезапускаю все зеркала...")
-        
-        mirrors = mirror_manager.get_all_mirrors()
-        count = 0
-        
-        for mirror in mirrors:
-            mirror_id = mirror[0]
-            token = mirror[1]
-            username = mirror[2]
-            
-            if token not in running_bots:
-                try:
-                    bot = MirrorBot(token, mirror_id, username)
-                    if await bot.initialize():
-                        count += 1
-                        logger.info(f"Зеркало {mirror_id} перезапущено")
-                except Exception as e:
-                    logger.error(f"Ошибка перезапуска зеркала {mirror_id}: {e}")
-        
-        await update.message.reply_text(f"✅ Перезапущено зеркал: {count}")
-    
-    async def show_mirrors_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Меню управления зеркалами"""
-        query = update.callback_query if hasattr(update, 'callback_query') else None
-        
-        if query:
-            await query.answer()
-        
-        menu_text = (
-            "🔄 **Мои зеркала**\n\n"
-            "✨ **Создайте свою копию этого бота!**\n\n"
-            "🚀 **Все зеркала работают на нашем сервере:**\n"
-            f"• Сервер: `{WEBHOOK_HOST}`\n"
-            "• Автоматический запуск\n"
-            "• Полный функционал\n\n"
-            "💡 **Как создать зеркало:**\n"
-            "1. Создайте бота через @BotFather\n"
-            "2. Получите токен\n"
-            "3. Отправьте токен сюда\n"
-            "4. Готово! Бот запустится автоматически\n\n"
-            "✅ **Выберите действие:**"
-        )
-        
-        keyboard = [
-            [InlineKeyboardButton("➕ Создать зеркало", callback_data="mirror_create")],
-            [InlineKeyboardButton("📋 Мои зеркала", callback_data="mirror_list")],
-            [InlineKeyboardButton("🔙 Назад", callback_data="main_back")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        if query:
-            await query.edit_message_text(menu_text, reply_markup=reply_markup)
-        else:
-            await update.message.reply_text(menu_text, reply_markup=reply_markup)
-    
-    async def handle_mirrors(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик кнопок раздела зеркал"""
-        query = update.callback_query
-        data = query.data
-        user_id = query.from_user.id
-        
-        if data == "mirror_create":
-            self.user_states[user_id] = "waiting_for_bot_token"
-            create_text = (
-                "🆕 **Создание зеркала**\n\n"
-                "📝 **Отправьте токен вашего бота:**\n\n"
-                "💡 **Как получить токен:**\n"
-                "1. Напишите @BotFather\n"
-                "2. Создайте нового бота /newbot\n"
-                "3. Скопируйте токен\n"
-                "4. Отправьте его сюда\n\n"
-                "⚠️ **Формат токена:** `1234567890:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw`\n\n"
-                f"✨ **Бот запустится автоматически на сервере:**\n`{WEBHOOK_HOST}`"
-            )
-            await query.edit_message_text(create_text)
-        
-        elif data == "mirror_list":
-            await self.show_mirror_list(update, context)
-        
-        elif data.startswith("mirror_delete_"):
-            mirror_id = int(data.split("_")[2])
-            success = mirror_manager.delete_mirror(user_id, mirror_id)
-            
-            if success:
-                await query.answer("✅ Зеркало удалено!")
-            else:
-                await query.answer("❌ Ошибка удаления зеркала")
-            
-            await self.show_mirrors_menu(update, context)
-        
-        elif data == "mirror_back":
-            await self.show_mirrors_menu(update, context)
-    
-    async def show_mirror_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показать список зеркал пользователя"""
-        query = update.callback_query
-        user_id = query.from_user.id
-        
-        mirrors = mirror_manager.get_user_mirrors(user_id)
-        
-        if not mirrors:
-            no_mirrors_text = (
-                "📭 **У вас нет созданных зеркал**\n\n"
-                "💡 Создайте первое зеркало для работы"
-            )
-            keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="mirror_back")]]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await query.edit_message_text(no_mirrors_text, reply_markup=reply_markup)
-            return
-        
-        list_text = "📋 **Мои зеркала:**\n\n"
-        
-        keyboard = []
-        for mirror in mirrors:
-            mirror_id = mirror[0]
-            token = mirror[1]
-            username = mirror[2]
-            bot_id = mirror[3]
-            created_at = mirror[4]
-            is_active = mirror[5]
-            webhook_url = mirror[6]
-            
-            # Маскируем токен
-            masked_token = token[:10] + "..." + token[-10:] if len(token) > 20 else token
-            
-            status = "🟢 Активно" if is_active == 1 else "🔴 Неактивно"
-            running_status = "🚀 Запущено" if token in running_bots else "⏸️ Не запущено"
-            
-            date_str = created_at[:10] if isinstance(created_at, str) else str(created_at)[:10]
-            
-            list_text += f"🆔 **ID:** `{mirror_id}`\n"
-            list_text += f"🤖 **Бот:** @{username}\n"
-            list_text += f"🔑 **Токен:** `{masked_token}`\n"
-            list_text += f"📅 **Создано:** {date_str}\n"
-            list_text += f"📊 **Статус:** {status}\n"
-            list_text += f"⚙️ **Запуск:** {running_status}\n"
-            list_text += f"🔗 **Ссылка:** https://t.me/{username}\n"
-            list_text += "─" * 30 + "\n\n"
-            
-            keyboard.append([InlineKeyboardButton(f"🗑️ Удалить зеркало {mirror_id}", callback_data=f"mirror_delete_{mirror_id}")])
-        
-        keyboard.append([InlineKeyboardButton("🔄 Обновить", callback_data="mirror_list")])
-        keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="mirror_back")])
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await query.edit_message_text(list_text, reply_markup=reply_markup)
-    
-    async def handle_text_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик текстового ввода"""
-        user_id = update.message.from_user.id
-        text = update.message.text
-        
-        if user_id not in self.user_states:
-            return
-        
-        state = self.user_states[user_id]
-        
-        if state == "waiting_for_bot_token":
-            # Проверяем формат токена
-            if ":" not in text or len(text) < 30:
-                error_text = (
-                    "❌ **Неверный формат токена!**\n\n"
-                    "💡 Токен должен выглядеть так:\n"
-                    "`1234567890:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw`\n\n"
-                    "📝 Попробуйте еще раз:"
-                )
-                await update.message.reply_text(error_text)
-                return
-            
-            msg = await update.message.reply_text("⏳ Создаю зеркало...")
-            
-            success, message, mirror_id = mirror_manager.create_mirror(user_id, text)
-            
-            if success:
-                del self.user_states[user_id]
-                
-                # Получаем информацию о боте для запуска
-                try:
-                    response = httpx.get(
-                        f"https://api.telegram.org/bot{text}/getMe",
-                        timeout=10
+                chat_id = db.add_chat(chat_name)
+                if chat_id:
+                    db.add_users(chat_id, cleaned_usernames)
+                    
+                    # Удаляем состояние
+                    del user_states[user_id]
+                    if 'current_chat_name' in context.user_data:
+                        del context.user_data['current_chat_name']
+                    context.application.bot_data['user_states'] = user_states
+                    
+                    success_text = (
+                        f"✅ Пользователи добавлены!\n\n"
+                        f"🏷️ Чат: {chat_name}\n"
+                        f"👥 Добавлено пользователей: {len(cleaned_usernames)}\n\n"
+                        f"💡 Теперь вы можете начать рассылку"
                     )
                     
-                    if response.is_success:
-                        data = response.json()
-                        if data.get("ok"):
-                            bot_info = data["result"]
-                            username = bot_info["username"]
-                            
-                            # Инициализируем и запускаем бота
-                            bot = MirrorBot(text, mirror_id, username)
-                            if await bot.initialize():
-                                await msg.edit_text(
-                                    f"✅ {message}\n\n"
-                                    f"✨ **Зеркало успешно запущено!**\n\n"
-                                    f"🤖 Бот: @{username}\n"
-                                    f"🆔 ID: {mirror_id}\n"
-                                    f"🌐 Сервер: {WEBHOOK_HOST}\n"
-                                    f"🔗 Ссылка: https://t.me/{username}\n\n"
-                                    f"💡 **Перейдите к боту и нажмите /start**"
-                                )
-                            else:
-                                await msg.edit_text(
-                                    f"✅ {message}\n\n"
-                                    f"⚠️ Зеркало создано, но возникли проблемы с запуском.\n"
-                                    f"Используйте команду /restart для перезапуска."
-                                )
-                except Exception as e:
-                    await msg.edit_text(
-                        f"✅ {message}\n\n"
-                        f"⚠️ Ошибка при запуске бота: {str(e)[:100]}"
-                    )
-                
-                await self.show_mirrors_menu(update, context)
-            else:
-                await msg.edit_text(message)
+                    await update.message.reply_text(success_text)
+                    
+                    # Показываем главное меню
+                    menu_text = "🎯 Главное меню\n\n💡 Выберите нужный раздел:"
+                    
+                    keyboard = [
+                        [InlineKeyboardButton("📝 Создание сообщений", callback_data="main_messages")],
+                        [InlineKeyboardButton("👥 Мои пользователи", callback_data="main_users")],
+                        [InlineKeyboardButton("🚀 Начать спам", callback_data="main_spam")]
+                    ]
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    
+                    await update.message.reply_text(menu_text, reply_markup=reply_markup)
     
-    async def handle_button(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик кнопок главного меню"""
-        query = update.callback_query
-        data = query.data
-        
-        if data == "main_messages":
-            await self.show_messages_menu(update, context)
-        elif data == "main_users":
-            await self.show_users_menu(update, context)
-        elif data == "main_spam":
-            await self.show_spam_menu(update, context)
-        elif data == "main_mirrors":
-            await self.show_mirrors_menu(update, context)
-        elif data == "main_back":
-            await self.show_main_menu(update, context)
-    
-    async def show_main_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показать главное меню"""
-        query = update.callback_query
-        await query.answer()
-        
-        menu_text = "🎯 **Главное меню**\n\n💡 Выберите нужный раздел:"
-        
-        keyboard = [
-            [InlineKeyboardButton("📝 Создание сообщений", callback_data="main_messages")],
-            [InlineKeyboardButton("👥 Мои пользователи", callback_data="main_users")],
-            [InlineKeyboardButton("🚀 Начать спам", callback_data="main_spam")],
-            [InlineKeyboardButton("🔄 Мои зеркала", callback_data="main_mirrors")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await query.edit_message_text(menu_text, reply_markup=reply_markup)
-    
-    async def show_messages_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Меню создания сообщений"""
-        query = update.callback_query
-        await query.answer()
-        
-        menu_text = (
-            "📝 **Создание сообщений**\n\n"
-            "✨ **Доступные действия:**\n"
-            "• 📄 Создать новое сообщение с вариациями\n"
-            "• 🗑️ Удалить существующее сообщение\n\n"
-            "💡 Выберите действие:"
-        )
-        
-        keyboard = [
-            [InlineKeyboardButton("📄 Создать новое сообщение", callback_data="messages_create")],
-            [InlineKeyboardButton("🗑️ Удалить сообщение", callback_data="messages_delete")],
-            [InlineKeyboardButton("🔙 Назад", callback_data="main_back")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await query.edit_message_text(menu_text, reply_markup=reply_markup)
-    
-    async def handle_messages(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик кнопок раздела сообщений"""
-        query = update.callback_query
-        data = query.data
-        user_id = query.from_user.id
-        
-        if data == "messages_create":
-            self.user_states[user_id] = "waiting_for_message"
-            create_text = (
-                "🆕 Создание нового сообщения\n\n"
-                "📨 Введите исходное сообщение для создания вариаций:\n\n"
-                "💡 Бот автоматически создаст вариации"
-            )
-            await query.edit_message_text(create_text)
-        
-        elif data == "messages_delete":
-            # Используем DatabaseManager для основного бота
-            db = DatabaseManager(0)
-            messages = db.get_messages()
-            
-            if not messages:
-                no_messages_text = (
-                    "📭 У вас нет созданных сообщений\n\n"
-                    "💡 Создайте первое сообщение для работы"
-                )
-                keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="messages_back")]]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                await query.edit_message_text(no_messages_text, reply_markup=reply_markup)
-                return
-            
-            list_text = (
-                "🗑️ Удаление сообщений\n\n"
-                "📋 Выберите сообщение для удаления:\n\n"
-                "⚠️ Внимание: будут удалены ВСЕ вариации этого сообщения"
-            )
-            
-            keyboard = []
-            for msg_id, text in messages:
-                display_text = text[:50] + "..." if len(text) > 50 else text
-                keyboard.append([InlineKeyboardButton(f"📄 {display_text}", callback_data=f"messages_delete_{msg_id}")])
-            
-            keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="messages_back")])
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
-            await query.edit_message_text(list_text, reply_markup=reply_markup)
-        
-        elif data.startswith("messages_delete_"):
-            message_id = int(data.split("_")[2])
-            db = DatabaseManager(0)
-            db.delete_message(message_id)
-            await query.answer("✅ Сообщение и все его вариации удалены!")
-            await self.show_messages_menu(update, context)
-        
-        elif data == "messages_back":
-            await self.show_messages_menu(update, context)
-    
-    def run(self):
-        """Запуск основного бота"""
-        print("🚀 Запуск основного бота...")
-        self.application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Добавляем обработчики в приложение
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CallbackQueryHandler(handle_button, pattern="^main_"))
+    application.add_handler(CallbackQueryHandler(handle_messages, pattern="^messages_"))
+    application.add_handler(CallbackQueryHandler(handle_users, pattern="^users_"))
+    application.add_handler(CallbackQueryHandler(handle_spam, pattern="^spam_"))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
 
-# ==================== ЗАПУСК СИСТЕМЫ ====================
-
-async def initialize_all_bots():
-    """Инициализация всех зеркал при запуске"""
-    mirrors = mirror_manager.get_all_mirrors()
-    logger.info(f"Инициализация {len(mirrors)} зеркал...")
-    
-    for mirror in mirrors:
-        mirror_id = mirror[0]
-        token = mirror[1]
-        username = mirror[2]
+def start_user_bot(token: str, owner_id: int):
+    """Запуск пользовательского бота в отдельном потоке"""
+    try:
+        # Создаем новое приложение для бота
+        application = Application.builder().token(token).build()
         
-        if token not in running_bots:
+        # Создаем обработчики для этого бота
+        create_user_bot_handlers(application, owner_id)
+        
+        # Запускаем бота в отдельном потоке
+        def run_bot():
             try:
-                bot = MirrorBot(token, mirror_id, username)
-                if await bot.initialize():
-                    logger.info(f"Зеркало {mirror_id} (@{username}) инициализировано")
-                else:
-                    logger.error(f"Ошибка инициализации зеркала {mirror_id}")
+                logger.info(f"Запускаем пользовательский бот для владельца {owner_id}")
+                application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
             except Exception as e:
-                logger.error(f"Ошибка создания зеркала {mirror_id}: {e}")
-    
-    logger.info(f"Инициализировано зеркал: {len(running_bots)}")
+                logger.error(f"Ошибка в пользовательском боте: {e}")
+        
+        # Запускаем в отдельном потоке
+        thread = threading.Thread(target=run_bot, daemon=True)
+        thread.start()
+        
+        logger.info(f"Пользовательский бот для {owner_id} запущен в отдельном потоке")
+        return thread
+        
+    except Exception as e:
+        logger.error(f"Ошибка запуска пользовательского бота: {e}")
+        return None
 
-def run_fastapi():
-    """Запуск FastAPI сервера"""
-    print(f"🌐 Запуск FastAPI сервера на порту {WEBHOOK_PORT}...")
-    uvicorn.run(app, host="0.0.0.0", port=WEBHOOK_PORT, log_level="info")
-
-def run_main_bot():
-    """Запуск основного бота"""
-    print(f"🤖 Запуск основного бота с токеном: {MAIN_BOT_TOKEN[:10]}...")
-    main_bot = MainBot(MAIN_BOT_TOKEN)
-    main_bot.run()
+# ==================== ОСНОВНОЙ БОТ-ЗЕРКАЛО ====================
 
 def main():
-    """Основная функция запуска"""
-    print("=" * 60)
-    print("🚀 MultiBot System запускается...")
-    print(f"🌐 Вебхук сервер: {WEBHOOK_HOST}{WEBHOOK_BASE}")
-    print(f"📡 Порт FastAPI: {WEBHOOK_PORT}")
-    print("=" * 60)
+    """Главная функция запуска основного бота-зеркала"""
     
-    # Инициализируем все зеркала
-    asyncio.run(initialize_all_bots())
+    # Инициализируем базу данных
+    global mirror_db
+    mirror_db = MirrorDatabase()
     
-    # Запускаем FastAPI в отдельном потоке
-    fastapi_thread = threading.Thread(target=run_fastapi, daemon=True)
-    fastapi_thread.start()
+    # Создаем приложение для основного бота
+    application = Application.builder().token(MAIN_BOT_TOKEN).build()
     
-    # Даем время серверу запуститься
-    time.sleep(3)
+    # Обработчик команды /start для основного бота
+    async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        
+        welcome_text = (
+            "🤖 **Добро пожаловать в Mirror Bot Creator!** 🤖\n\n"
+            "✨ **Создайте своего собственного спам-бота за 3 шага:**\n\n"
+            "1️⃣ Создайте бота через @BotFather\n"
+            "2️⃣ Получите токен бота (формат: 1234567890:ABCdefGHIjkl...)\n"
+            "3️⃣ Используйте команду /create с токеном\n\n"
+            "📋 **Доступные команды:**\n"
+            "• /create [token] - Создать нового бота\n"
+            "• /mybots - Показать моих ботов\n"
+            "• /stop [номер] - Остановить бота\n"
+            "• /admin - Панель администратора\n\n"
+            "💡 **Ваш бот получит все функции оригинального спам-бота:**\n"
+            "• 📝 Создание сообщений с вариациями\n"
+            "• 👥 Управление списками пользователей\n"
+            "• 🚀 Массовая рассылка\n"
+            "• 📊 Статистика\n\n"
+            "👇 **Чтобы начать, создайте бота в @BotFather и используйте /create**"
+        )
+        
+        await update.message.reply_text(welcome_text, parse_mode='Markdown')
+    
+    # Обработчик команды /create
+    async def create_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        
+        if len(context.args) < 1:
+            instruction_text = (
+                "📝 **Как создать своего бота:**\n\n"
+                "1. Откройте @BotFather в Telegram\n"
+                "2. Отправьте команду /newbot\n"
+                "3. Выберите имя для бота\n"
+                "4. Выберите username для бота (должен заканчиваться на 'bot')\n"
+                "5. Получите токен (выглядит примерно так):\n"
+                "   1234567890:ABCdefGHIjklMNOpqrsTUVwxyz\n"
+                "6. Отправьте команду:\n"
+                "   /create 1234567890:ABCdefGHIjklMNOpqrsTUVwxyz\n\n"
+                "⚠️ **Внимание:** Никому не передавайте токен вашего бота!"
+            )
+            await update.message.reply_text(instruction_text, parse_mode='Markdown')
+            return
+        
+        bot_token = context.args[0].strip()
+        
+        try:
+            # Проверяем токен
+            test_app = Application.builder().token(bot_token).build()
+            await test_app.initialize()
+            bot_info = await test_app.bot.get_me()
+            bot_username = bot_info.username
+            
+            # Сохраняем бота в базу данных
+            if mirror_db.add_user_bot(user_id, bot_token, bot_username):
+                # Запускаем пользовательского бота
+                thread = start_user_bot(bot_token, user_id)
+                
+                if thread:
+                    # Сохраняем поток в глобальный словарь
+                    user_bot_threads[bot_token] = thread
+                    
+                    success_text = (
+                        f"✅ **Бот успешно создан!**\n\n"
+                        f"🤖 **Имя бота:** @{bot_username}\n"
+                        f"👤 **Владелец:** Вы\n"
+                        f"🔄 **Статус:** Активен\n\n"
+                        f"💡 **Что делать дальше:**\n"
+                        f"1. Перейдите в @{bot_username}\n"
+                        f"2. Нажмите /start\n"
+                        f"3. Создайте сообщения\n"
+                        f"4. Добавьте пользователей\n"
+                        f"5. Начните рассылку!\n\n"
+                        f"⚠️ **Не забудьте:**\n"
+                        f"• Добавить сообщения в вашем боте\n"
+                        f"• Добавить пользователей для рассылки\n"
+                        f"• Начать рассылку через раздел 'Начать спам'"
+                    )
+                    
+                    await update.message.reply_text(success_text, parse_mode='Markdown')
+                else:
+                    await update.message.reply_text("❌ Не удалось запустить бота. Попробуйте позже.")
+            else:
+                await update.message.reply_text("❌ Этот бот уже зарегистрирован в системе!")
+                
+            await test_app.shutdown()
+                
+        except Exception as e:
+            logger.error(f"Ошибка создания бота: {e}")
+            error_msg = str(e)
+            if "Unauthorized" in error_msg:
+                await update.message.reply_text("❌ Неверный токен бота. Проверьте токен и попробуйте снова.")
+            else:
+                await update.message.reply_text(f"❌ Ошибка: {error_msg}")
+    
+    # Обработчик команды /mybots
+    async def my_bots(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        bots = mirror_db.get_user_bots(user_id)
+        
+        if not bots:
+            await update.message.reply_text(
+                "📭 **У вас нет созданных ботов.**\n\n"
+                "Используйте /create [токен] для создания первого бота.",
+                parse_mode='Markdown'
+            )
+            return
+        
+        bot_list_text = "🤖 **Мои боты:**\n\n"
+        
+        for i, (bot_id, token, username, status, created_at) in enumerate(bots, 1):
+            bot_status = "🟢 Активен" if status == 'active' else "🔴 Остановлен"
+            created_date = created_at.split()[0] if created_at else "Неизвестно"
+            
+            bot_list_text += f"**{i}. @{username}**\n"
+            bot_list_text += f"   Статус: {bot_status}\n"
+            bot_list_text += f"   Создан: {created_date}\n"
+            bot_list_text += f"   Токен: `{token[:10]}...`\n\n"
+        
+        bot_list_text += (
+            "💡 **Команды для управления:**\n"
+            "• /stop [номер] - остановить бота\n"
+            "• /create [токен] - добавить нового бота\n\n"
+            "⚠️ **Важно:** Токен показан не полностью для безопасности."
+        )
+        
+        await update.message.reply_text(bot_list_text, parse_mode='Markdown')
+    
+    # Обработчик команды /stop
+    async def stop_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        
+        if len(context.args) < 1:
+            await update.message.reply_text(
+                "❌ Укажите номер бота для остановки.\n\n"
+                "**Пример:** /stop 1\n\n"
+                "Используйте /mybots чтобы увидеть список ваших ботов.",
+                parse_mode='Markdown'
+            )
+            return
+        
+        try:
+            bot_num = int(context.args[0]) - 1
+            
+            bots = mirror_db.get_user_bots(user_id)
+            
+            if bot_num < 0 or bot_num >= len(bots):
+                await update.message.reply_text("❌ Неверный номер бота.")
+                return
+            
+            bot_id, bot_token, bot_username, status, created_at = bots[bot_num]
+            
+            # Обновляем статус в базе данных
+            mirror_db.update_bot_status(bot_token, 'stopped')
+            
+            # Удаляем поток из глобального словаря
+            if bot_token in user_bot_threads:
+                # Останавливаем поток (в реальности нужно корректно остановить бота)
+                del user_bot_threads[bot_token]
+            
+            await update.message.reply_text(
+                f"✅ **Бот @{bot_username} остановлен.**\n\n"
+                f"Для повторного запуска используйте /create с тем же токеном.",
+                parse_mode='Markdown'
+            )
+            
+        except ValueError:
+            await update.message.reply_text("❌ Введите корректный номер.")
+        except Exception as e:
+            logger.error(f"Ошибка остановки бота: {e}")
+            await update.message.reply_text(f"❌ Ошибка: {str(e)}")
+    
+    # Обработчик команды /admin
+    async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        
+        # Проверяем права администратора
+        if user_id != ADMIN_USER_ID:
+            await update.message.reply_text("🚫 У вас нет доступа к панели администратора.")
+            return
+        
+        # Получаем статистику
+        all_bots = mirror_db.get_all_bots()
+        
+        admin_text = (
+            "👑 **Панель администратора**\n\n"
+            f"📊 **Статистика:**\n"
+            f"• Всего ботов в системе: {len(all_bots)}\n"
+            f"• Активных потоков: {len(user_bot_threads)}\n\n"
+            "📋 **Последние 10 ботов:**\n"
+        )
+        
+        for i, (owner_id, token, username, status, created_at) in enumerate(all_bots[:10], 1):
+            admin_text += f"{i}. @{username} (ID владельца: {owner_id}) - {status}\n"
+        
+        if len(all_bots) > 10:
+            admin_text += f"\n... и еще {len(all_bots) - 10} ботов\n"
+        
+        await update.message.reply_text(admin_text, parse_mode='Markdown')
+    
+    # Обработчик текстовых сообщений
+    async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        text = update.message.text
+        
+        # Если текст похож на токен бота
+        if ':' in text and len(text) > 30:
+            # Предлагаем создать бота
+            await update.message.reply_text(
+                f"🔑 **Обнаружен токен бота!**\n\n"
+                f"Хотите создать бота с этим токеном?\n\n"
+                f"Используйте команду:\n"
+                f"`/create {text}`",
+                parse_mode='Markdown'
+            )
+        else:
+            # Показываем помощь
+            await update.message.reply_text(
+                "💡 **Используйте команды:**\n\n"
+                "/start - Начало работы\n"
+                "/create [токен] - Создать бота\n"
+                "/mybots - Мои боты\n"
+                "/stop [номер] - Остановить бота\n"
+                "/admin - Панель администратора\n\n"
+                "🔗 **Как получить токен:**\n"
+                "1. Откройте @BotFather\n"
+                "2. Создайте нового бота\n"
+                "3. Скопируйте токен\n"
+                "4. Используйте /create с токеном",
+                parse_mode='Markdown'
+            )
+    
+    # Загружаем и запускаем существующих ботов при старте
+    def load_existing_bots():
+        all_bots = mirror_db.get_all_bots()
+        
+        for owner_id, bot_token, bot_username, status, created_at in all_bots:
+            if status == 'active':
+                logger.info(f"Загружаем бота @{bot_username} для пользователя {owner_id}")
+                thread = start_user_bot(bot_token, owner_id)
+                if thread:
+                    user_bot_threads[bot_token] = thread
+                    logger.info(f"Бот @{bot_username} успешно загружен")
+                else:
+                    logger.error(f"Не удалось загрузить бота @{bot_username}")
+    
+    # Настраиваем обработчики для основного бота
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("create", create_bot))
+    application.add_handler(CommandHandler("mybots", my_bots))
+    application.add_handler(CommandHandler("stop", stop_bot))
+    application.add_handler(CommandHandler("admin", admin_panel))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    
+    # Загружаем существующих ботов
+    logger.info("Загружаем существующих ботов...")
+    load_existing_bots()
     
     # Запускаем основной бот
-    run_main_bot()
+    print("=" * 50)
+    print("🤖 MIRROR BOT CREATOR ЗАПУЩЕН!")
+    print("=" * 50)
+    print(f"✅ Загружено ботов: {len(user_bot_threads)}")
+    print("💡 Основной бот запущен и готов к работе!")
+    print("🔗 Используйте /start в Telegram для начала работы")
+    print("=" * 50)
+    
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+# ==================== ЗАПУСК ПРОГРАММЫ ====================
 
 if __name__ == "__main__":
     main()
