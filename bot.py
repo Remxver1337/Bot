@@ -1,14 +1,20 @@
 import logging
 import sqlite3
 import random
+import json
+import asyncio
 import threading
-import time
-import os
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 from urllib.parse import quote
+from datetime import datetime
+import secrets
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+from telegram.request import HTTPXRequest
+from fastapi import FastAPI, Request, HTTPException
+import uvicorn
+import httpx
 
 # Настройка логирования
 logging.basicConfig(
@@ -23,10 +29,18 @@ REPLACEMENTS = {
     'А': 'A', 'С': 'C', 'О': 'O', 'Р': 'P', 'Е': 'E', 'Х': 'X', 'У': 'Y'
 }
 
+# Конфигурация сервера
+WEBHOOK_HOST = "https://ваш-домен.ру"  # ИЛИ "https://ваш-сервер.ком"
+WEBHOOK_PORT = 8443  # или 443 для HTTPS
+WEBHOOK_SECRET = secrets.token_hex(32)
+
+# FastAPI приложение
+app = FastAPI(title="MultiBot Server")
+
 # Глобальные словари
-running_bots = {}  # token -> thread
-bot_threads = {}   # token -> threading.Thread
-bot_applications = {}  # token -> Application
+running_bots: Dict[str, Application] = {}  # token -> Application
+bot_databases: Dict[str, 'DatabaseManager'] = {}  # token -> DatabaseManager
+bot_instances: Dict[str, 'MirrorBot'] = {}  # token -> MirrorBot
 
 class MirrorManager:
     def __init__(self):
@@ -44,8 +58,11 @@ class MirrorManager:
                 user_id INTEGER NOT NULL,
                 bot_token TEXT NOT NULL UNIQUE,
                 bot_username TEXT,
+                bot_id INTEGER,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                is_active INTEGER DEFAULT 1
+                is_active INTEGER DEFAULT 1,
+                webhook_url TEXT,
+                last_activity TIMESTAMP
             )
         ''')
         
@@ -55,15 +72,13 @@ class MirrorManager:
     def create_mirror(self, user_id: int, bot_token: str) -> Tuple[bool, str, int]:
         """Создание нового зеркала"""
         try:
-            import requests
-            
             # Проверяем токен
-            response = requests.get(
+            response = httpx.get(
                 f"https://api.telegram.org/bot{bot_token}/getMe",
                 timeout=10
             )
             
-            if response.status_code != 200:
+            if not response.is_success:
                 return False, "❌ Ошибка подключения к Telegram API", 0
             
             data = response.json()
@@ -72,24 +87,31 @@ class MirrorManager:
             
             bot_info = data["result"]
             bot_username = bot_info["username"]
+            bot_id = bot_info["id"]
+            
+            # Генерируем уникальный путь для вебхука
+            webhook_path = f"/webhook/{bot_id}"
+            webhook_url = f"{WEBHOOK_HOST}{webhook_path}"
             
             conn = sqlite3.connect(self.db_name)
             cursor = conn.cursor()
             
             try:
                 cursor.execute('''
-                    INSERT INTO mirrors (user_id, bot_token, bot_username, created_at) 
-                    VALUES (?, ?, ?, datetime('now'))
-                ''', (user_id, bot_token, bot_username))
+                    INSERT INTO mirrors (user_id, bot_token, bot_username, bot_id, webhook_url, created_at) 
+                    VALUES (?, ?, ?, ?, ?, datetime('now'))
+                ''', (user_id, bot_token, bot_username, bot_id, webhook_url))
                 
                 mirror_id = cursor.lastrowid
                 conn.commit()
                 
-                # Запускаем бота в отдельном потоке
-                if self.start_bot_thread(bot_token, mirror_id, bot_username):
-                    return True, f"✅ Зеркало создано и запущено! Бот: @{bot_username}", mirror_id
-                else:
-                    return True, f"✅ Зеркало создано, но не удалось запустить. Бот: @{bot_username}", mirror_id
+                # Сразу устанавливаем вебхук
+                try:
+                    self.setup_webhook(bot_token, webhook_url, webhook_path)
+                except Exception as e:
+                    logger.error(f"Ошибка установки вебхука: {e}")
+                
+                return True, f"✅ Зеркало создано! Бот: @{bot_username}", mirror_id
                 
             except sqlite3.IntegrityError:
                 cursor.execute('SELECT id, bot_username FROM mirrors WHERE bot_token = ?', (bot_token,))
@@ -104,64 +126,33 @@ class MirrorManager:
             logger.error(f"Ошибка создания зеркала: {e}")
             return False, f"❌ Ошибка: {str(e)}", 0
     
-    def start_bot_thread(self, token: str, mirror_id: int, username: str) -> bool:
-        """Запуск бота в отдельном потоке"""
+    def setup_webhook(self, token: str, webhook_url: str, webhook_path: str):
+        """Установка вебхука для бота"""
         try:
-            # Проверяем, не запущен ли уже
-            if token in running_bots:
-                return True
-            
-            # Создаем и запускаем поток
-            thread = threading.Thread(
-                target=self.run_mirror_bot,
-                args=(token, mirror_id, username),
-                daemon=True
+            # Устанавливаем вебхук через Telegram API
+            response = httpx.post(
+                f"https://api.telegram.org/bot{token}/setWebhook",
+                json={
+                    "url": webhook_url,
+                    "secret_token": WEBHOOK_SECRET,
+                    "drop_pending_updates": True
+                },
+                timeout=10
             )
             
-            bot_threads[token] = thread
-            thread.start()
-            
-            # Ждем немного для инициализации
-            time.sleep(2)
-            
-            if token in running_bots:
-                logger.info(f"Бот {mirror_id} (@{username}) запущен в потоке")
-                return True
-            else:
-                logger.error(f"Не удалось запустить бот {mirror_id}")
-                return False
-                
-        except Exception as e:
-            logger.error(f"Ошибка запуска потока бота {mirror_id}: {e}")
+            if response.is_success:
+                data = response.json()
+                if data.get("ok"):
+                    logger.info(f"Вебхук установлен для токена {token[:10]}...")
+                    return True
+                else:
+                    logger.error(f"Ошибка установки вебхука: {data}")
+                    return False
             return False
-    
-    def run_mirror_bot(self, token: str, mirror_id: int, username: str):
-        """Функция для запуска в потоке"""
-        try:
-            logger.info(f"Запуск бота {mirror_id} (@{username})...")
-            
-            # Создаем application
-            application = Application.builder().token(token).build()
-            
-            # Создаем экземпляр бота
-            bot = MirrorBot(application, mirror_id, username)
-            bot.setup_handlers()
-            
-            # Сохраняем в глобальный словарь
-            running_bots[token] = application
-            bot_applications[token] = application
-            
-            logger.info(f"Бот {mirror_id} (@{username}) готов к запуску polling")
-            
-            # Запускаем polling
-            application.run_polling(allowed_updates=Update.ALL_TYPES)
             
         except Exception as e:
-            logger.error(f"Ошибка в потоке бота {mirror_id}: {e}")
-            if token in running_bots:
-                del running_bots[token]
-            if token in bot_threads:
-                del bot_threads[token]
+            logger.error(f"Ошибка установки вебхука: {e}")
+            return False
     
     def get_user_mirrors(self, user_id: int) -> List[Tuple]:
         """Получение списка зеркал пользователя"""
@@ -169,11 +160,26 @@ class MirrorManager:
         cursor = conn.cursor()
         
         cursor.execute('''
-            SELECT id, bot_token, bot_username, created_at, is_active
+            SELECT id, bot_token, bot_username, bot_id, created_at, is_active, webhook_url, last_activity
             FROM mirrors 
             WHERE user_id = ? 
             ORDER BY created_at DESC
         ''', (user_id,))
+        
+        mirrors = cursor.fetchall()
+        conn.close()
+        return mirrors
+    
+    def get_all_mirrors(self) -> List[Tuple]:
+        """Получение всех зеркал"""
+        conn = sqlite3.connect(self.db_name)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT id, bot_token, bot_username, bot_id, user_id, is_active, webhook_url
+            FROM mirrors 
+            WHERE is_active = 1
+        ''')
         
         mirrors = cursor.fetchall()
         conn.close()
@@ -194,13 +200,38 @@ class MirrorManager:
             
             token = result[0]
             
-            # Останавливаем бота
-            self.stop_bot(token)
+            # Удаляем вебхук
+            try:
+                response = httpx.post(
+                    f"https://api.telegram.org/bot{token}/deleteWebhook",
+                    timeout=10
+                )
+            except:
+                pass
             
             # Удаляем из базы
             cursor.execute('DELETE FROM mirrors WHERE id = ? AND user_id = ?', (mirror_id, user_id))
             conn.commit()
             conn.close()
+            
+            # Очищаем глобальные словари
+            if token in running_bots:
+                try:
+                    del running_bots[token]
+                except:
+                    pass
+            
+            if token in bot_databases:
+                try:
+                    del bot_databases[token]
+                except:
+                    pass
+            
+            if token in bot_instances:
+                try:
+                    del bot_instances[token]
+                except:
+                    pass
             
             logger.info(f"Зеркало {mirror_id} удалено")
             return True
@@ -208,21 +239,6 @@ class MirrorManager:
         except Exception as e:
             logger.error(f"Ошибка удаления зеркала: {e}")
             return False
-    
-    def stop_bot(self, token: str):
-        """Остановка бота"""
-        try:
-            if token in running_bots:
-                app = running_bots[token]
-                app.stop()
-                del running_bots[token]
-                logger.info(f"Бот с токеном {token[:10]}... остановлен")
-            
-            if token in bot_threads:
-                del bot_threads[token]
-                
-        except Exception as e:
-            logger.error(f"Ошибка остановки бота: {e}")
 
 mirror_manager = MirrorManager()
 
@@ -382,21 +398,50 @@ class DatabaseManager:
         return variations
 
 class MirrorBot:
-    def __init__(self, application: Application, mirror_id: int, username: str):
-        self.application = application
+    def __init__(self, token: str, mirror_id: int, username: str):
+        self.token = token
         self.mirror_id = mirror_id
         self.username = username
+        self.application = None
         self.user_states = {}
         self.db = DatabaseManager(mirror_id)
-    
-    def setup_handlers(self):
-        """Настройка обработчиков"""
-        self.application.add_handler(CommandHandler("start", self.start_handler))
-        self.application.add_handler(CallbackQueryHandler(self.handle_button, pattern="^main_"))
-        self.application.add_handler(CallbackQueryHandler(self.handle_messages, pattern="^messages_"))
-        self.application.add_handler(CallbackQueryHandler(self.handle_users, pattern="^users_"))
-        self.application.add_handler(CallbackQueryHandler(self.handle_spam, pattern="^spam_"))
-        self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text_input))
+        
+    async def initialize(self):
+        """Инициализация бота"""
+        try:
+            # Создаем уникальный request для каждого бота
+            request = HTTPXRequest()
+            
+            # Создаем application
+            self.application = (
+                Application.builder()
+                .token(self.token)
+                .request(request)
+                .build()
+            )
+            
+            # Настраиваем обработчики
+            self.application.add_handler(CommandHandler("start", self.start_handler))
+            self.application.add_handler(CallbackQueryHandler(self.handle_button, pattern="^main_"))
+            self.application.add_handler(CallbackQueryHandler(self.handle_messages, pattern="^messages_"))
+            self.application.add_handler(CallbackQueryHandler(self.handle_users, pattern="^users_"))
+            self.application.add_handler(CallbackQueryHandler(self.handle_spam, pattern="^spam_"))
+            self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text_input))
+            
+            # Инициализируем приложение
+            await self.application.initialize()
+            
+            # Сохраняем в глобальные словари
+            running_bots[self.token] = self.application
+            bot_databases[self.token] = self.db
+            bot_instances[self.token] = self
+            
+            logger.info(f"Бот {self.mirror_id} (@{self.username}) инициализирован")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Ошибка инициализации бота {self.mirror_id}: {e}")
+            return False
     
     def generate_variations(self, text: str, count: int = 500) -> List[str]:
         """Генерация вариаций сообщения"""
@@ -888,6 +933,51 @@ class MirrorBot:
         
         await update.message.reply_text(menu_text, reply_markup=reply_markup)
 
+# ==================== FASTAPI ОБРАБОТЧИКИ ====================
+
+@app.post("/webhook/{bot_id}")
+async def handle_webhook(bot_id: str, request: Request):
+    """Обработчик вебхуков для всех ботов"""
+    try:
+        # Проверяем secret token
+        secret_token = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+        if secret_token != WEBHOOK_SECRET:
+            raise HTTPException(status_code=403, detail="Forbidden")
+        
+        # Получаем данные из запроса
+        data = await request.json()
+        
+        # Ищем бота по ID
+        token = None
+        for mirror in mirror_manager.get_all_mirrors():
+            if str(mirror[3]) == bot_id:  # bot_id находится на позиции 3
+                token = mirror[1]
+                break
+        
+        if not token or token not in running_bots:
+            raise HTTPException(status_code=404, detail="Bot not found")
+        
+        # Обрабатываем обновление через соответствующее приложение
+        application = running_bots[token]
+        
+        # Создаем Update объект
+        update = Update.de_json(data, application.bot)
+        
+        # Обрабатываем обновление
+        await application.process_update(update)
+        
+        return {"status": "ok"}
+        
+    except Exception as e:
+        logger.error(f"Ошибка обработки вебхука: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.get("/")
+async def root():
+    return {"status": "MultiBot Server is running", "bots": len(running_bots)}
+
+# ==================== ОСНОВНОЙ БОТ ====================
+
 class MainBot:
     def __init__(self, token: str):
         self.token = token
@@ -917,7 +1007,7 @@ class MainBot:
             "👥 Мои пользователи - добавьте списки пользователей для рассылки\n"
             "🚀 Начать спам - запустите рассылку сообщений\n"
             "🔄 Мои зеркала - создавайте свои боты с полным функционалом!\n\n"
-            "✨ **Все зеркала работают в отдельных потоках!**\n\n"
+            "✨ **Все зеркала работают на одном сервере!**\n\n"
             "💡 Выберите раздел:"
         )
         
@@ -939,17 +1029,18 @@ class MainBot:
         """Перезапуск всех зеркал"""
         await update.message.reply_text("🔄 Перезапускаю все зеркала...")
         
-        mirrors = mirror_manager.get_user_mirrors(update.effective_user.id)
+        mirrors = mirror_manager.get_all_mirrors()
         count = 0
         
-        for mirror in mirrors:
-            mirror_id = mirror[0]
-            token = mirror[1]
-            username = mirror[2]
-            
-            if token not in running_bots:
-                if mirror_manager.start_bot_thread(token, mirror_id, username):
-                    count += 1
+        for mirror_id, token, username, bot_id, user_id, is_active, webhook_url in mirrors:
+            if is_active and token not in running_bots:
+                try:
+                    bot = MirrorBot(token, mirror_id, username)
+                    if await bot.initialize():
+                        count += 1
+                        logger.info(f"Зеркало {mirror_id} перезапущено")
+                except Exception as e:
+                    logger.error(f"Ошибка перезапуска зеркала {mirror_id}: {e}")
         
         await update.message.reply_text(f"✅ Перезапущено зеркал: {count}")
     
@@ -963,7 +1054,7 @@ class MainBot:
         menu_text = (
             "🔄 **Мои зеркала**\n\n"
             "✨ **Создайте свою копию этого бота!**\n\n"
-            "🚀 **Все зеркала работают в отдельных потоках:**\n"
+            "🚀 **Все зеркала работают на одном сервере:**\n"
             "• Не нужно отдельное VPS\n"
             "• Автоматический запуск\n"
             "• Полный функционал\n\n"
@@ -1004,7 +1095,7 @@ class MainBot:
                 "3. Скопируйте токен\n"
                 "4. Отправьте его сюда\n\n"
                 "⚠️ **Формат токена:** `1234567890:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw`\n\n"
-                "✨ **Бот запустится автоматически в отдельном потоке!**"
+                "✨ **Бот запустится автоматически на нашем сервере!**"
             )
             await query.edit_message_text(create_text)
         
@@ -1045,13 +1136,7 @@ class MainBot:
         list_text = "📋 **Мои зеркала:**\n\n"
         
         keyboard = []
-        for mirror in mirrors:
-            mirror_id = mirror[0]
-            token = mirror[1]
-            username = mirror[2]
-            created_at = mirror[3]
-            is_active = mirror[4]
-            
+        for mirror_id, token, username, bot_id, created_at, is_active, webhook_url, last_activity in mirrors:
             # Маскируем токен
             masked_token = token[:10] + "..." + token[-10:] if len(token) > 20 else token
             
@@ -1105,10 +1190,56 @@ class MainBot:
             
             if success:
                 del self.user_states[user_id]
-                await msg.edit_text(f"✅ {message}")
+                
+                # Запускаем бота
+                try:
+                    # Получаем информацию о боте
+                    response = httpx.get(
+                        f"https://api.telegram.org/bot{text}/getMe",
+                        timeout=10
+                    )
+                    
+                    if response.is_success:
+                        data = response.json()
+                        if data.get("ok"):
+                            bot_info = data["result"]
+                            username = bot_info["username"]
+                            
+                            # Инициализируем и запускаем бота
+                            bot = MirrorBot(text, mirror_id, username)
+                            if await bot.initialize():
+                                await msg.edit_text(
+                                    f"✅ {message}\n\n"
+                                    f"✨ **Зеркало успешно запущено!**\n\n"
+                                    f"🤖 Бот: @{username}\n"
+                                    f"🆔 ID: {mirror_id}\n"
+                                    f"🔗 Ссылка: https://t.me/{username}\n\n"
+                                    f"💡 **Перейдите к боту и нажмите /start**"
+                                )
+                            else:
+                                await msg.edit_text(
+                                    f"✅ {message}\n\n"
+                                    f"⚠️ Зеркало создано, но возникли проблемы с запуском.\n"
+                                    f"Используйте команду /restart для перезапуска."
+                                )
+                        else:
+                            await msg.edit_text(f"✅ {message}\n\n⚠️ Не удалось получить информацию о боте")
+                    else:
+                        await msg.edit_text(f"✅ {message}\n\n⚠️ Ошибка подключения к Telegram API")
+                        
+                except Exception as e:
+                    await msg.edit_text(
+                        f"✅ {message}\n\n"
+                        f"⚠️ Зеркало создано, но возникла ошибка при запуске:\n"
+                        f"{str(e)[:200]}"
+                    )
+                
                 await self.show_mirrors_menu(update, context)
             else:
                 await msg.edit_text(message)
+    
+    # Остальные методы (для сообщений, пользователей, спама) остаются такими же
+    # как в предыдущих примерах
     
     async def handle_button(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик кнопок главного меню"""
@@ -1199,60 +1330,72 @@ class MainBot:
 
 # ==================== ЗАПУСК СИСТЕМЫ ====================
 
-def start_all_mirrors():
-    """Запуск всех зеркал при старте"""
-    print("🚀 Запуск всех сохраненных зеркал...")
+async def initialize_all_bots():
+    """Инициализация всех зеркал при запуске"""
+    mirrors = mirror_manager.get_all_mirrors()
+    logger.info(f"Инициализация {len(mirrors)} зеркал...")
     
-    # Сначала получаем всех пользователей
-    conn = sqlite3.connect("mirrors.db")
-    cursor = conn.cursor()
-    
-    cursor.execute('SELECT DISTINCT user_id FROM mirrors WHERE is_active = 1')
-    users = cursor.fetchall()
-    
-    for user_tuple in users:
-        user_id = user_tuple[0]
-        mirrors = mirror_manager.get_user_mirrors(user_id)
+    for mirror in mirrors:
+        mirror_id, token, username, bot_id, user_id, is_active, webhook_url = mirror
         
-        for mirror in mirrors:
-            mirror_id = mirror[0]
-            token = mirror[1]
-            username = mirror[2]
-            
-            if token not in running_bots:
-                print(f"  Запускаю зеркало {mirror_id} (@{username})...")
-                mirror_manager.start_bot_thread(token, mirror_id, username)
-                time.sleep(1)  # Небольшая задержка между запусками
+        if is_active and token not in running_bots:
+            try:
+                bot = MirrorBot(token, mirror_id, username)
+                if await bot.initialize():
+                    logger.info(f"Зеркало {mirror_id} (@{username}) инициализировано")
+                else:
+                    logger.error(f"Ошибка инициализации зеркала {mirror_id}")
+            except Exception as e:
+                logger.error(f"Ошибка создания зеркала {mirror_id}: {e}")
     
-    conn.close()
-    
-    print(f"✅ Запущено зеркал: {len(running_bots)}")
+    logger.info(f"Инициализировано зеркал: {len(running_bots)}")
 
-def main():
+async def run_server():
+    """Запуск FastAPI сервера"""
+    config = uvicorn.Config(
+        app,
+        host="0.0.0.0",
+        port=WEBHOOK_PORT,
+        log_level="info"
+    )
+    server = uvicorn.Server(config)
+    await server.serve()
+
+async def main():
     """Основная функция запуска"""
-    print("=" * 60)
-    print("🤖 MultiBot System - Запуск системы...")
-    print("=" * 60)
+    # Инициализируем все зеркала
+    await initialize_all_bots()
     
-    # Запускаем все сохраненные зеркала
-    start_all_mirrors()
-    
-    # Даем время для запуска потоков
-    time.sleep(3)
+    # Запускаем FastAPI сервер в отдельной задаче
+    server_task = asyncio.create_task(run_server())
     
     # Запускаем основной бот
-    BOT_TOKEN = "8517379434:AAGqMYBuEQZ8EMNRf3g4yBN-Q0jpm5u5eZU"  # Ваш токен
+    BOT_TOKEN = "ВАШ_ТОКЕН_ОСНОВНОГО_БОТА"  # Замените на ваш токен
     
-    print(f"🎯 Основной бот запускается с токеном: {BOT_TOKEN[:10]}...")
-    print("💡 Используйте /start в Telegram")
-    print("=" * 60)
+    print("🚀 Запуск MultiBot системы...")
+    print(f"🌐 Вебхук сервер: {WEBHOOK_HOST}:{WEBHOOK_PORT}")
+    print(f"🤖 Зеркал инициализировано: {len(running_bots)}")
     
     # Запускаем основной бот
     main_bot = MainBot(BOT_TOKEN)
-    main_bot.run()
+    
+    # Запускаем polling основного бота в отдельном потоке
+    import threading
+    
+    def run_main_bot():
+        asyncio.run(main_bot.application.run_polling())
+    
+    bot_thread = threading.Thread(target=run_main_bot, daemon=True)
+    bot_thread.start()
+    
+    print("🎯 Основной бот запущен")
+    print("💡 Используйте /start в Telegram")
+    
+    # Ждем завершения сервера
+    await server_task
 
 if __name__ == "__main__":
-    # Установите зависимости:
-    # pip install python-telegram-bot
+    # ВАЖНО: Замените на ваш реальный домен или IP
+    WEBHOOK_HOST = "https://ваш-домен.ру"  # ИЛИ "https://ваш-сервер.ком"
     
-    main()
+    asyncio.run(main())
