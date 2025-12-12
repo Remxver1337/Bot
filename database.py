@@ -19,7 +19,7 @@ class Database:
                 bot_username TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                status TEXT DEFAULT 'active',  # 'active', 'inactive', 'disabled'
+                status TEXT DEFAULT 'active',
                 is_enabled BOOLEAN DEFAULT 1
             )
         ''')
@@ -69,23 +69,20 @@ class Database:
     
     def add_mirror_bot(self, user_id, bot_token, bot_username):
         try:
-            # Проверяем лимит ботов
             self.cursor.execute(
                 'SELECT COUNT(*) FROM mirror_bots WHERE user_id = ?',
                 (user_id,)
             )
             count = self.cursor.fetchone()[0]
             
-            if count >= 1:  # MAX_MIRRORS_PER_USER
+            if count >= 1:
                 return False, "limit_reached"
             
-            # Добавляем бота
             self.cursor.execute(
                 'INSERT INTO mirror_bots (user_id, bot_token, bot_username) VALUES (?, ?, ?)',
                 (user_id, bot_token, bot_username)
             )
             
-            # Добавляем создателя как пользователя с доступом
             self.cursor.execute(
                 'INSERT INTO bot_access (bot_token, user_id) VALUES (?, ?)',
                 (bot_token, user_id)
@@ -176,7 +173,6 @@ class Database:
         self.conn.commit()
     
     def check_inactive_bots(self):
-        # Находим боты, неактивные более INACTIVITY_DAYS дней
         cutoff_date = datetime.now() - timedelta(days=7)
         self.cursor.execute(
             '''UPDATE mirror_bots 
@@ -205,7 +201,6 @@ class Database:
         return self.cursor.fetchone()
     
     def add_bot_access(self, owner_id, bot_token, access_user_id):
-        # Проверяем, что владелец добавляет
         self.cursor.execute(
             'SELECT COUNT(*) FROM mirror_bots WHERE user_id = ? AND bot_token = ?',
             (owner_id, bot_token)
@@ -213,14 +208,13 @@ class Database:
         if self.cursor.fetchone()[0] == 0:
             return False, "not_owner"
         
-        # Проверяем лимит пользователей
         self.cursor.execute(
             'SELECT COUNT(*) FROM bot_access WHERE bot_token = ?',
             (bot_token,)
         )
         count = self.cursor.fetchone()[0]
         
-        if count >= 10:  # MAX_ACCESS_USERS + owner
+        if count >= 10:
             return False, "limit_reached"
         
         try:
@@ -234,7 +228,6 @@ class Database:
             return False, "already_exists"
     
     def check_bot_access(self, user_id, bot_token):
-        # Проверяем доступ к боту
         self.cursor.execute(
             '''SELECT 1 FROM mirror_bots 
                WHERE bot_token = ? AND (user_id = ? OR bot_token IN (
