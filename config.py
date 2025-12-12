@@ -1,19 +1,31 @@
 import os
-from dotenv import load_dotenv
+import sys
 
-load_dotenv()
+print("=" * 50)
+print("CONFIG.PY: Настройки для bothost.ru")
+print("=" * 50)
 
-# Конфигурация
-ADMIN_ID = 7404231636  # Ваш Telegram ID
-MAIN_BOT_TOKEN = os.getenv('MAIN_BOT_TOKEN')
-DOMAIN = os.getenv('DOMAIN', 'your-domain.com')
-PORT = int(os.getenv('PORT', 8443))
+# Токен основного бота
+MAIN_BOT_TOKEN = "8568866654:AAFfLobjJfnbjwltSdy4IAw_-3yBzw3rGm8"
 
-# Настройки вебхука
-WEBHOOK_PATH = f"/webhook/{{token}}"
-WEBHOOK_URL = f"https://{DOMAIN}{WEBHOOK_PATH}"
+# Админ
+ADMIN_ID = 7404231636
+
+# Домен и порт для зеркальных ботов (вебхуки)
+MIRROR_DOMAIN = "bot_1765579907_1589_remxver1337.bothost.ru"
+MIRROR_PORT = 443
+MIRROR_WEBHOOK_URL = f"https://{MIRROR_DOMAIN}/webhook"
+
+print(f"✅ Токен основного бота: {MAIN_BOT_TOKEN[:15]}...")
+print(f"✅ Админ ID: {ADMIN_ID}")
+print(f"✅ Домен для зеркал: {MIRROR_DOMAIN}")
+print(f"✅ Порт для зеркал: {MIRROR_PORT}")
+print(f"✅ Webhook URL для зеркал: {MIRROR_WEBHOOK_URL}/{{token}}")
 
 # Ограничения
 MAX_MIRRORS_PER_USER = 1
 MAX_ACCESS_USERS = 10
-INACTIVITY_DAYS = 7  # дней неактивности до отключения
+INACTIVITY_DAYS = 7
+
+print("✅ Конфигурация загружена!")
+print("=" * 50)
