@@ -12,8 +12,8 @@ MAIN_BOT_TOKEN = "8568866654:AAFfLobjJfnbjwltSdy4IAw_-3yBzw3rGm8"
 ADMIN_ID = 7404231636
 
 # Домен и порт для зеркальных ботов (вебхуки)
-MIRROR_DOMAIN = "bot_1765579907_1589_remxver1337.bothost.ru"
-MIRROR_PORT = 443
+MIRROR_DOMAIN = "bot_1765620884_7888_remxver1337.bothost.ru"
+MIRROR_PORT = 8443
 MIRROR_WEBHOOK_URL = f"https://{MIRROR_DOMAIN}/webhook"
 
 print(f"✅ Токен основного бота: {MAIN_BOT_TOKEN[:15]}...")
